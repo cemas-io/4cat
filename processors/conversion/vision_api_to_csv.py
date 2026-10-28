@@ -4,6 +4,7 @@ Convert Google Vision API annotations to CSV
 import csv
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
 
 __author__ = "Stijn Peeters"
@@ -29,6 +30,9 @@ class ConvertVisionOutputToCSV(BasicProcessor):
                    "to the original dataset.")  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
+    # Allow processor on Google Vision API output
+    compatibility = Compatibility(types={"google-vision-api"})
+
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
         """
@@ -49,16 +53,6 @@ class ConvertVisionOutputToCSV(BasicProcessor):
             }
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Determine if processor is compatible with dataset
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.type == "google-vision-api"
-
     def process(self):
         """
         This takes the NDJSON file as input and writes the same data as a CSV file
@@ -69,8 +63,7 @@ class ConvertVisionOutputToCSV(BasicProcessor):
         self.dataset.update_status("Converting posts")
 
         if not self.source_file.exists():
-            self.dataset.update_status("No data was returned by the Google Vision API, so none can be converted.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No data was returned by the Google Vision API, so none can be converted.")
             return
 
         # Write annotations to original file?

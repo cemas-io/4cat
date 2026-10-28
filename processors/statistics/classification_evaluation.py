@@ -5,6 +5,7 @@ Generate accuracy, F1, recall, and precision scores for labels in two columns.
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.helpers import UserInput, andify
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, cohen_kappa_score
@@ -22,9 +23,13 @@ class ClassificationEvaluation(BasicProcessor):
     type = "classification_evaluation"  # job type ID
     category = "Statistics"  # category
     title = "Classification evaluation"  # title displayed in UI
-    description = ("Use labels from two columns to calculate evaluation metrics (accuracy, precision, recall, F1, "
-                   "and Cohen's Kappa). Produces overall and per-label metrics. Also supports multi-label values.")
+    description = ("Use calculate evaluation metrics (accuracy, precision, recall, F1, "
+                   "and Cohen's Kappa) with labels from two columns. Produces overall and per-label metrics. "
+                   "Also supports multi-label values.")
     extension = "csv"  # extension of result file, used internally and in UI
+
+    # Allow on CSV/NDJSON datasets
+    compatibility = Compatibility(extensions={"csv", "ndjson"})
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -100,17 +105,6 @@ class ClassificationEvaluation(BasicProcessor):
 
         return options
 
-    @staticmethod
-    def is_compatible_with(module=None, config=None):
-        """
-        Determine compatibility
-
-        :param Dataset module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-        return module.get_extension() in ("csv", "ndjson")
-
     def process(self):
 
         skip_empty = self.parameters.get("skip_empty", False)
@@ -130,6 +124,7 @@ class ClassificationEvaluation(BasicProcessor):
         column_pred = self.parameters.get("column_pred", "")
         if not column_true or not column_pred:
             self.dataset.finish_with_error("Please specify which columns contain the true and predicted labels")
+            return
 
         # Get values
         labels_true = []
@@ -137,6 +132,7 @@ class ClassificationEvaluation(BasicProcessor):
 
         # Prepare list of labels
         count = 1
+        skipped = 0
 
         self.dataset.update_status("Preparing labels")
         for item in self.source_dataset.iterate_items():
@@ -149,6 +145,7 @@ class ClassificationEvaluation(BasicProcessor):
             count += 1
 
             if skip_empty and (not label_pred or not label_true):
+                skipped += 1
                 self.dataset.update_status(f"Skipping row {count}, no input value(s)")
                 continue
             elif not skip_empty and (not label_pred or not label_true):
@@ -162,6 +159,7 @@ class ClassificationEvaluation(BasicProcessor):
                     label_true = str(label_true).lower().strip()
                     label_pred = str(label_pred).lower().strip()
                 except ValueError:
+                    skipped += 1
                     self.dataset.update_status(f"Labels '{label_true}' and '{label_pred}' could not be converted to "
                                                f"text (types: {type(label_true)}, {type(label_pred)}), skipping")
                     continue
@@ -229,4 +227,5 @@ class ClassificationEvaluation(BasicProcessor):
 
         # Finish up
         self.dataset.update_status("Saving results")
-        self.write_csv_items_and_finish(results)
+        warning = None if not skipped else f"Skipped {skipped} rows that were empty or could not be converted"
+        self.write_csv_items_and_finish(results, warning=warning)

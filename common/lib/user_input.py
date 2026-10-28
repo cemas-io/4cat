@@ -4,6 +4,7 @@ from werkzeug.datastructures import ImmutableMultiDict
 import json
 
 import re
+from itertools import chain
 
 class RequirementsNotMetException(Exception):
     """
@@ -26,10 +27,10 @@ class UserInput:
     OPTION_TEXT = "string"  # simple string or integer (input text)
     OPTION_MULTI = "multi"  # multiple values out of a list (select multiple)
     OPTION_MULTI_SELECT = "multi_select"  # multiple values out of a dropdown list (select multiple)
+    OPTION_MULTI_OPTION = "multi_option"  # several instances of a collection of controls
     OPTION_INFO = "info"  # just a bit of text, not actual input
     OPTION_TEXT_LARGE = "textarea"  # longer text
     OPTION_TEXT_JSON = "json"  # text, but should be valid JSON
-    OPTION_DATE = "date"  # a single date
     OPTION_DATERANGE = "daterange"  # a beginning and end date
     OPTION_DIVIDER = "divider"  # meta-option, divides related sets of options
     OPTION_FILE = "file"  # file upload
@@ -181,6 +182,45 @@ class UserInput:
 
                 parsed_input[option] = table_input
 
+            elif settings.get("type") == UserInput.OPTION_MULTI_OPTION:
+                # these are collections of other input options that can be
+                # repeated an arbitrary amount of times and are saved as a
+                # list of these values
+                # i.e. forms within forms!!!
+                item_options = settings["options"]
+                input_items = {}
+                for key, value in input.items():
+                    if key_match := re.match(f"{option}-([0-9]+)-(.+)", key):
+                        input_index = int(key_match[1])
+                        # note: the index is just used to match inputs to items
+                        # it is not used for ordering
+                        option_item = key_match[2]
+                        if option_item not in item_options:
+                            continue
+
+                        if input_index not in input_items:
+                            input_items[input_index] = {}
+
+                        input_items[input_index][option_item] = UserInput.parse_value(item_options[option_item], value, input_items[input_index], silently_correct)
+
+                # discard items that are only default values
+                parsed_input[option] = []
+                for input_index, item in input_items.items():
+                    only_default = True
+                    for key, value in item.items():
+                        if value != item_options[key]["default"]:
+                            only_default = False
+
+                    if not only_default:
+                        parsed_input[option].append(item)
+
+                # may define a mapper to make this a dict
+                if settings.get("dict_key"):
+                    if callable(settings["dict_key"]):
+                        parsed_input[option] = {settings["dict_key"](value): {**value, "_id": settings["dict_key"](value)} for value in parsed_input[option]}
+                    else:
+                        parsed_input[option] = {value[settings["dict_key"]]: {**value, "_id": value[settings["dict_key"]]} for value in parsed_input[option]}
+
             elif option not in input:
                 # not provided? use default
                 parsed_input[option] = settings.get("default", None)
@@ -193,6 +233,91 @@ class UserInput:
                     pass
 
         return parsed_input
+
+    @staticmethod
+    def _requirement_met(req, other_input):
+        """
+        Evaluate a single requirement expression against already-parsed input.
+
+        A requirement is a string of the form ``field[operator]value``. Returns
+        True if the requirement is satisfied, False otherwise. The caller is
+        responsible for combining the results of multiple requirements with the
+        appropriate AND/OR logic.
+
+        Supported operators:
+          ==  / =   exact equality
+          !=        negated equality
+          ^=        value starts with
+          !^=       value does not start with
+          $=        value ends with
+          !$=       value does not end with
+          ~=        value contains (or, for lists, is a member of)
+          !~=       value does not contain / is not a member of
+
+        :param str req:          The requirement string to evaluate.
+        :param dict other_input: Already-parsed input to check against.
+        :return bool:            True if the requirement is satisfied.
+        """
+        try:
+            field, operator, value = re.findall(r"([a-zA-Z0-9_-]+)([!=$~^]+)(.*)", req)[0]
+        except IndexError:
+            # no operator found: treat the whole string as a bare field name
+            # and check that a field with that name is present and non-empty
+            field, operator, value = (req, "!=", "")
+
+        if not other_input or field not in other_input:
+            # the referenced field has not been parsed yet (or no input at all)
+            return False
+
+        negated = operator.startswith("!")
+        if negated:
+            operator = operator[1:]
+
+        other_value = other_input.get(field)
+        if type(other_value) is bool:
+            # boolean values come from toggle/checkbox options
+            if operator in ("==", "="):
+                # True matches "true"/"checked"; False matches ""/"false"
+                if ((other_value and value in ("", "false")) or (not other_value and value in ("true", "checked"))) != negated:
+                    return False
+            else:
+                # any non-equality operator: check truthy/falsy in the same way
+                if ((other_value and value not in ("true", "checked")) or (not other_value and value not in ("", "false"))) != negated:
+                    return False
+
+        else:
+            if type(other_value) in (tuple, list):
+                # iterables are a bit special
+                if len(other_value) == 1:
+                    # single-item list: unwrap and treat as a scalar below
+                    other_value = other_value[0]
+                elif operator == "~=":
+                    # multi-item list + ~= means 'is value a member of this list?'
+                    if (value not in other_value) != negated:
+                        return False
+                    return True  # handled; skip scalar checks below
+                elif not negated:
+                    # other operators don't have a meaningful multi-item list
+                    # interpretation; treat as not satisfied
+                    return False
+                # a negated non-~= operator on a multi-item list falls through
+                # to the scalar checks below (with other_value still a list)
+
+            # scalar (or unwrapped single-item list) comparisons
+            if operator == "^=" and str(other_value).startswith(value) == negated:
+                # starts-with check
+                return False
+            elif operator == "$=" and str(other_value).endswith(value) == negated:
+                # ends-with check
+                return False
+            elif operator == "~=" and (value in str(other_value)) == negated:
+                # substring / contains check
+                return False
+            elif operator in ("==", "=") and (value == other_value) == negated:
+                # exact-equality check
+                return False
+
+        return True
 
     @staticmethod
     def parse_value(settings, choice, other_input=None, silently_correct=True):
@@ -212,52 +337,42 @@ class UserInput:
         :return:  Validated and parsed input
         """
         # short-circuit if there is a requirement for the field to be parsed
-        # and the requirement isn't met
+        # and the requirement isn't met.
+        # 'requires' may be:
+        #   - a single string:          "field==value"
+        #   - an &&-joined string:      "field1==v1 && field2==v2"  (all must be true)
+        #   - a ||-joined string:       "field1==v1 || field2==v2"  (any must be true)
+        #   - a list/tuple of strings:  AND semantics (all must be true)
         if settings.get("requires"):
-            try:
-                field, operator, value = re.findall(r"([a-zA-Z0-9_-]+)([!=$~^]+)(.*)", settings.get("requires"))[0]
-            except IndexError:
-                # invalid condition, interpret as 'does the field with this name have a value'
-                field, operator, value = (choice, "!=", "")
+            reqs = settings["requires"]
 
-            if field not in other_input:
-                raise RequirementsNotMetException()
-
-            negated = operator.startswith("!")
-            if negated:
-                operator = operator[1:]
-
-            other_value = other_input.get(field)
-            if type(other_value) is bool:
-                # evalues to a boolean, i.e. checkboxes etc
-                if operator in ("==", "="):
-                    if ((other_value and value in ("", "false")) or (not other_value and value in ("true", "checked"))) != negated:
-                        raise RequirementsNotMetException()
-                else:
-                    if ((other_value and value not in ("true", "checked")) or (not other_value and value not in ("", "false"))) != negated:
-                        raise RequirementsNotMetException()
-
+            # normalise to a list of individual requirement strings plus a flag
+            # indicating whether they combine with AND (True) or OR (False)
+            if isinstance(reqs, (list, tuple)):
+                # a list always uses AND semantics: every requirement must be satisfied
+                req_list = list(reqs)
+                combine_and = True
+            elif "||" in reqs:
+                # pipe-separated alternatives: any one is sufficient (OR)
+                req_list = [r.strip() for r in reqs.split("||")]
+                combine_and = False
+            elif "&&" in reqs:
+                # ampersand-separated conditions: all must hold (AND)
+                req_list = [r.strip() for r in reqs.split("&&")]
+                combine_and = True
             else:
-                if type(other_value) in (tuple, list):
-                    # iterables are a bit special
-                    if len(other_value) == 1:
-                        # treat one-item lists as "normal" values
-                        other_value = other_value[0]
-                    elif operator == "~=":  # interpret as 'is in list?'
-                        if (value not in other_value) != negated:
-                            raise RequirementsNotMetException()
-                    elif not negated:
-                        # condition doesn't make sense for a list, so assume it's not True
-                        raise RequirementsNotMetException()
+                # single requirement string — original behaviour
+                req_list = [reqs]
+                combine_and = True
 
-                if operator == "^=" and str(other_value).startswith(value) == negated:
-                    raise RequirementsNotMetException()
-                elif operator == "$=" and str(other_value).endswith(value) == negated:
-                    raise RequirementsNotMetException()
-                elif operator == "~=" and (value in str(other_value)) == negated:
-                    raise RequirementsNotMetException()
-                elif operator in ("==", "=") and (value == other_value) == negated:
-                    raise RequirementsNotMetException()
+            results = [UserInput._requirement_met(r, other_input) for r in req_list]
+
+            if combine_and and not all(results):
+                # AND mode: every requirement must be satisfied
+                raise RequirementsNotMetException()
+            elif not combine_and and not any(results):
+                # OR mode: at least one requirement must be satisfied
+                raise RequirementsNotMetException()
 
         input_type = settings.get("type", "")
         if input_type in UserInput.OPTIONS_COSMETIC:
@@ -277,18 +392,21 @@ class UserInput:
             else:
                 raise QueryParametersException("Toggle invalid input")
 
-        elif input_type in (UserInput.OPTION_DATE, UserInput.OPTION_DATERANGE):
+        elif input_type == UserInput.OPTION_DATERANGE:
             # parse either integers (unix timestamps) or try to guess the date
             # format (the latter may be used for input if JavaScript is turned
             # off in the front-end and the input comes from there)
-            value = None
             try:
-                value = int(choice)
-            except ValueError:
-                parsed_choice = parse_datetime(choice)
-                value = int(parsed_choice.timestamp())
-            finally:
-                return value
+                return int(choice)
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                return int(parse_datetime(choice).timestamp())
+            except (ValueError, TypeError, OverflowError, OSError):
+                # no date, or nothing that reads as one; this end of the
+                # range is left open
+                return None
 
         elif input_type in (UserInput.OPTION_MULTI, UserInput.OPTION_ANNOTATIONS):
             # any number of values out of a list of possible values
@@ -317,9 +435,16 @@ class UserInput:
             # select box
             # one out of multiple options
             # return option if valid, or default
-            if choice not in settings.get("options"):
+            options = settings.get("options", {})
+
+            # if we have a categorised set of options, look deeper to get
+            # valid option values
+            is_categorised = all([type(o) is dict for o in options.values()])
+            match_options = list(chain(*[list(o.keys()) for o in options.values()])) if is_categorised else options
+
+            if choice not in match_options:
                 if not silently_correct:
-                    raise QueryParametersException(f"Invalid value selected; must be one of {', '.join(settings.get('options', {}).keys())}. {settings}")
+                    raise QueryParametersException(f"Invalid value selected; must be one of {', '.join(match_options)}.")
                 else:
                     return settings.get("default", "")
             else:

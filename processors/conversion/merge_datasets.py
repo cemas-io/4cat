@@ -9,6 +9,7 @@ from common.lib.dataset import DataSet
 from common.lib.exceptions import ProcessorInterruptedException, DataSetException
 from common.lib.helpers import UserInput
 from common.lib.item_mapping import MappedItem
+from common.lib.compatibility import Compatibility
 import ural
 
 __author__ = "Stijn Peeters"
@@ -29,15 +30,8 @@ class DatasetMerger(BasicProcessor):
     description = "Merge this dataset with other datasets of the same format. A new dataset is " \
                   "created containing a combination of items from the original datasets."  # description displayed in UI
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on any top-level CSV or NDJSON file
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.get_extension() in ("csv", "ndjson") and (module.is_from_collector())
+    # a collector's csv or ndjson output
+    compatibility = Compatibility(is_collector=True, extensions={"csv", "ndjson"})
 
     @staticmethod
     def get_dataset_from_url(url, db, modules=None):
@@ -122,26 +116,26 @@ class DatasetMerger(BasicProcessor):
             try:
                 source_dataset = self.get_dataset_from_url(source_dataset_url, self.db, modules=self.modules)
             except DataSetException:
-                return self.dataset.finish_with_error(f"Dataset URL '{source_dataset_url} not found - cannot perform "
+                return self.dataset.finish_with_error(f"Dataset URL '{source_dataset_url} not found, cannot perform "
                                                       f"merge.")
 
             if not source_dataset.is_finished():
-                return self.dataset.finish_with_error(f"Dataset with URL {source_dataset_url} is unfinished - finish "
+                return self.dataset.finish_with_error(f"Dataset with URL {source_dataset_url} is unfinished, finish "
                                                       f"datasets before merging.")
 
             #if source_dataset.type != self.source_dataset.type:
             #    return self.dataset.finish_with_error(f"Dataset with URL {source_dataset_url} is not of the right "
-            #                                          f"type - all datasets must be of the type "
+            #                                          f"type, all datasets must be of the type "
             #                                          f"'{self.source_dataset.type}")
 
             if not set(source_dataset.get_owners_users("owner")).intersection(
                     set(self.source_dataset.get_owners_users("owner"))) and (
                     source_dataset.is_private or self.source_dataset.is_private):
-                return self.dataset.finish_with_error("Cannot merge datasets - all need to be public or have "
+                return self.dataset.finish_with_error("Cannot merge datasets, all need to be public or have "
                                                       "overlapping ownership.")
 
             if source_dataset.key in [d.key for d in source_datasets]:
-                self.dataset.update_status(f"Skipping dataset with URL {source_dataset_url} - already in list of "
+                self.dataset.update_status(f"Skipping dataset with URL {source_dataset_url}, already in list of "
                                            f"datasets to merge")
             else:
                 total_items += source_dataset.num_rows
@@ -215,9 +209,11 @@ class DatasetMerger(BasicProcessor):
 
                 except NotImplementedError:
                     self.dataset.finish_with_error(f"Datasets comprising {dataset.get_extension()} files cannot be merged. You can only merge NDJSON or CSV datasets.")
+                    return
 
         # log any raised warnings to dataset log
         num_warnings = sum([sum(w.values()) for w in warnings.values()])
+        final_warning = None
         if num_warnings > 0:
             for dataset, dataset_warnings in warnings.items():
                 if sum(dataset_warnings.values()) == 0:
@@ -226,15 +222,15 @@ class DatasetMerger(BasicProcessor):
                 self.dataset.log(f"The following warning(s) were raised while processing items from dataset {dataset}:")
                 for dataset_warning, num_items in dataset_warnings.items():
                     self.dataset.log(f"  {dataset_warning} ({num_items:,} item(s))")
+            final_warning = f". Found {num_warnings} warnings while merging; see logs for details."
 
-        # phew, finally done
-        self.dataset.update_status(f"Merged {processed:,} items ({merged:,} merged, {duplicates:,} skipped, {num_warnings:,} warnings). See dataset log for details.",
-                                   is_final=True)
-
-
+        final_status = f"Merged {processed:,} items ({merged:,} merged, {duplicates:,} skipped)"
         self.dataset.update_progress(1)
-
-        self.dataset.finish(processed)
+        if final_warning:
+            self.dataset.finish_with_warning(processed, final_status + final_warning)
+        else:
+            self.dataset.update_status(final_status, is_final=True)
+            self.dataset.finish(processed)
 
     def update_progress(self, processed, total, force=False):
         """
@@ -286,5 +282,12 @@ class DatasetMerger(BasicProcessor):
         else:
             standalone.update_label(f"(Merged) {self.source_dataset.get_label()}")
 
-        standalone.parameters = {**self.dataset.parameters, "board": "merged"}
-        standalone.type = self.source_dataset.type
+        # Wholesale-overwriting parameters here would clobber the producer_type
+        # stashed by create_standalone -> adopt_type; preserve it explicitly so
+        # the UI can still resolve this dataset back to merge-datasets.
+        standalone.parameters = {
+            **self.dataset.parameters,
+            "board": "merged",
+            "producer_type": standalone.parameters.get("producer_type", self.type),
+        }
+        standalone.adopt_type(self.source_dataset.type)

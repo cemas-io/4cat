@@ -3,6 +3,7 @@ Create a collage of items in a grid
 """
 import statistics
 import random
+import json
 import shutil
 import oslex
 import math
@@ -12,6 +13,7 @@ from packaging import version
 
 from common.lib.helpers import UserInput, get_ffmpeg_version, convert_to_int
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility, ExecutableSibling
 from common.lib.exceptions import ProcessorInterruptedException, MediaSignatureException
 
 __author__ = "Stijn Peeters"
@@ -33,6 +35,9 @@ class VideoWallGenerator(BasicProcessor):
     title = "Video wall"  # title displayed in UI
     description = "Put all videos in a single combined video, side by side. Videos can be sorted and resized."
     extension = "mp4"  # extension of result file, used internally and in UI
+
+    # Allow on video datasets when ffmpeg and ffprobe are available
+    compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, required_settings={("video-downloader.ffmpeg_path", ExecutableSibling("ffmpeg", "ffprobe"))})
 
     # videos will be arranged and resized to fit these image wall dimensions
     # note that video aspect ratio may not allow for a precise fit
@@ -128,25 +133,6 @@ class VideoWallGenerator(BasicProcessor):
             }
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Determine compatibility
-
-        :param DataSet module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-        if not (module.get_media_type() == "video" or module.type.startswith("video-downloader")):
-            return False
-        else:
-            # Only check these if we have a video dataset
-            # also need ffprobe to determine video lengths
-            # is usually installed in same place as ffmpeg
-            ffmpeg_path = shutil.which(config.get("video-downloader.ffmpeg_path"))
-            ffprobe_path = shutil.which("ffprobe".join(ffmpeg_path.rsplit("ffmpeg", 1))) if ffmpeg_path else None
-            return ffmpeg_path and ffprobe_path
-
     def process(self):
         """
         Go through media files, determine dimensions, sort according to the
@@ -199,13 +185,16 @@ class VideoWallGenerator(BasicProcessor):
 
         # unpack items and determine length of the item (for sorting)
         self.dataset.update_status("Unpacking files and reading metadata")
-        for item in base_dataset.iterate_items(immediately_delete=False):
+        for item in base_dataset.iterate_items(self, immediately_delete=False):
             if self.interrupted:
                 return ProcessorInterruptedException("Interrupted while unpacking files")
 
             # skip metadata and log files
             self.dataset.update_status(f"Determined dimensions of {len(media):,} of {self.source_dataset.num_rows:,} file(s)")
             if item.file.suffix.lower() in (".json", ".log"):
+                continue
+            elif item.file.name == "video_archive":
+                # yt-dlp created file
                 continue
 
             try:
@@ -623,11 +612,11 @@ class VideoWallGenerator(BasicProcessor):
                 f"Could not make collage (error {process.returncode}); check the dataset log for details.")
 
         if skipped:
-             self.dataset.update_status(f"Rendering finished. {skipped} item(s) were skipped; see dataset log for details.", is_final=True)
+             self.dataset.finish_with_warning(1, f"Rendering finished. {skipped} item(s) were skipped. See dataset log for details.")
         else:
-             self.dataset.update_status("Rendering finished.")
-
-        self.dataset.finish(1)
+             self.dataset.update_status("Rendering finished.", is_final=True)
+             self.dataset.finish(1)
+        return
 
     def get_signature(self, file_path, sort_mode, ffprobe_path):
         """
@@ -646,22 +635,23 @@ class VideoWallGenerator(BasicProcessor):
         0.
         """
         probe_command = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries",
-                         "stream=width,height,duration", "-of", "csv=p=0", oslex.quote(str(file_path))]
+                         "stream=width,height,duration:format=duration", "-of", "json", str(file_path)]
 
         probe = self.run_interruptable_process(probe_command)
 
-        probe_output = probe.stdout.decode("utf-8")
-        probe_error = probe.stderr.decode("utf-8")
+        if probe.stderr:
+            raise MediaSignatureException(probe.stderr.decode("utf-8", errors="replace"))
 
-        if probe_error:
-            raise MediaSignatureException()
-
-        bits = probe_output.split(",")
-        length = (float(bits[-1]) if bits[-1].strip() != "N/A" else 0)
         try:
-            dimensions = (int(bits[0]), int(bits[1]))
-        except ValueError:
-            raise MediaSignatureException()
+            probe_output = json.loads(probe.stdout)
+            stream = probe_output["streams"][0]
+            dimensions = (int(stream["width"]), int(stream["height"]))
+        except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+            raise MediaSignatureException(str(e))
+
+        # ffprobe leaves out the duration when it is unknown, e.g. for images;
+        # some video formats (e.g. webm) only store it for the whole file
+        length = float(stream.get("duration", probe_output.get("format", {}).get("duration", 0)))
 
         if sort_mode == "random":
             sort_value = random.random()

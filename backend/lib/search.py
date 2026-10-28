@@ -1,6 +1,4 @@
-import hashlib
 import zipfile
-import secrets
 import random
 import json
 import math
@@ -11,7 +9,8 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 from backend.lib.processor import BasicProcessor
-from common.lib.helpers import strip_tags, dict_search_and_update, remove_nuls, HashCache
+from common.lib.author_info import AuthorInfoReplacer
+from common.lib.helpers import strip_tags, remove_nuls, format_import_item
 from common.lib.exceptions import WorkerInterruptedException, ProcessorInterruptedException, MapItemException
 
 
@@ -42,6 +41,11 @@ class Search(BasicProcessor, ABC):
 	#: from. If this is `4chan`, for example, items are read from
 	#: `posts_4chan`.
 	prefix = ""
+
+	#: Extra HTTP headers to send when downloading this platform's images and
+	#: videos, e.g. a Referer for platforms that refuse requests that seem to
+	#: come from another website
+	media_request_headers = {}
 
 	# Columns to return in csv
 	# Mandatory columns: ['thread_id', 'body', 'subject', 'timestamp']
@@ -166,7 +170,6 @@ class Search(BasicProcessor, ABC):
 				f"Processor {self.type} importing item without map_item method for Dataset {self.dataset.type} - {self.dataset.key}")
 
 		with path.open(encoding="utf-8") as infile:
-			unmapped_items = False
 			for i, line in enumerate(infile):
 				if self.interrupted:
 					raise WorkerInterruptedException()
@@ -187,10 +190,7 @@ class Search(BasicProcessor, ABC):
 					continue
 
 
-				new_item = {
-					**item["data"],
-					"__import_meta": {k: v for k, v in item.items() if k != "data"}
-				}
+				new_item = format_import_item(item)
 
 				# Check map item here!
 				if check_map_item:
@@ -215,8 +215,8 @@ class Search(BasicProcessor, ABC):
 					except MapItemException as e:
 						# NOTE: we still yield the unmappable item; perhaps we need to update a processor's map_item method to account for this new item
 						self.import_error_count += 1
-						self.dataset.warn_unmappable_item(item_count=i, processor=self, error_message=e, warn_admins=unmapped_items is False)
-						unmapped_items = True
+						# Per-item user-facing log entry.
+						self.dataset.warn_unmappable_item(item_count=i, processor=self, error_message=e)
 
 				yield new_item
 
@@ -229,6 +229,28 @@ class Search(BasicProcessor, ABC):
 
 		path.unlink()
 		self.dataset.delete_parameter("file")
+
+	def get_author_filter(self):
+		"""
+		Get something to hide author information with, if the dataset asks for it
+
+		Whether to hash author details, remove them, or leave them alone is
+		chosen when the dataset is created. Which field names hold those details
+		depends on the data source, which can list its own name patterns in a
+		`pseudonymise_fields` attribute.
+
+		Hashes are salted with a random value that is thrown away afterwards, so
+		the same person gets a different hash in every dataset and nobody can
+		work out later which person a hash belongs to.
+
+		:return AuthorInfoReplacer:  Or `None` if this dataset was created
+		without hiding author information.
+		"""
+		mode = self.parameters.get("pseudonymise")
+		if mode not in AuthorInfoReplacer.MODES:
+			return None
+
+		return AuthorInfoReplacer(mode, fields=getattr(self, "pseudonymise_fields", None))
 
 	def items_to_csv(self, results, filepath):
 		"""
@@ -250,18 +272,7 @@ class Search(BasicProcessor, ABC):
 		if not isinstance(filepath, Path):
 			filepath = Path(filepath)
 
-		# cache hashed author names, so the hashing function (which is
-		# relatively expensive) is not run too often
-		pseudonymise_author = self.parameters.get("pseudonymise", None) == "pseudonymise"
-		anonymise_author = self.parameters.get("pseudonymise", None) == "anonymise"
-
-		# prepare hasher (which we may or may not need)
-		# we use BLAKE2	for its (so far!) resistance against cryptanalysis and
-		# speed, since we will potentially need to calculate a large amount of
-		# hashes
-		salt = secrets.token_bytes(16)
-		hasher = hashlib.blake2b(digest_size=24, salt=salt)
-		hash_cache = HashCache(hasher)
+		author_filter = self.get_author_filter()
 
 		processed = 0
 		header_written = False
@@ -314,21 +325,17 @@ class Search(BasicProcessor, ABC):
 				if row["body"]:
 					row["body"] = strip_tags(row["body"])
 
-				# replace author column with salted hash of the author name, if
-				# pseudonymisation is enabled
-				if pseudonymise_author:
-					author_fields = [field for field in row.keys() if field.startswith("author")]
-					for author_field in author_fields:
-						row[author_field] = hash_cache.update_cache(row[author_field])
-
-				# or remove data altogether, if it's anonymisation instead
-				elif anonymise_author:
-					for field in row.keys():
-						if field.startswith("author"):
-							row[field] = "REDACTED"
+				# hash or remove the author's details, if asked for
+				if author_filter:
+					row = author_filter.filter_row(row)
 
 				row = remove_nuls(row)
 				writer.writerow(row)
+
+		# an empty dataset has nothing to replace, which says nothing about
+		# whether the field names were right, so do not record that
+		if author_filter and processed:
+			self.dataset.author_info_replaced = author_filter.report()
 
 		return processed
 
@@ -339,9 +346,10 @@ class Search(BasicProcessor, ABC):
 		NDJSON is a file with one valid JSON value per line, in this case each
 		of these JSON values represents a retrieved item. This is useful if the
 		retrieved data cannot easily be completely stored as a flat CSV file
-		and we want to leave the choice of how to flatten it to the user. Note
-		that no conversion (e.g. html stripping or pseudonymisation) is done
-		here - the items are saved as-is.
+		and we want to leave the choice of how to flatten it to the user. Items
+		are saved as the platform sent them, apart from the author's details
+		being hashed or removed if the dataset was created with that option; no
+		other conversion (e.g. html stripping) is done here.
 
 		:param Iterator items:  Items to save
 		:param Path filepath:  Location to save results file
@@ -349,14 +357,7 @@ class Search(BasicProcessor, ABC):
 		if not filepath:
 			raise ResourceWarning("No valid results path supplied")
 
-		# figure out if we need to filter the data somehow
-		hash_cache = None
-		if self.parameters.get("pseudonymise") == "pseudonymise":
-			# cache hashed author names, so the hashing function (which is
-			# relatively expensive) is not run too often
-			hasher = hashlib.blake2b(digest_size=24)
-			hasher.update(str(self.config.get('ANONYMISATION_SALT')).encode("utf-8"))
-			hash_cache = HashCache(hasher)
+		author_filter = self.get_author_filter()
 
 		processed = 0
 		with filepath.open("w", encoding="utf-8", newline="") as outfile:
@@ -364,14 +365,18 @@ class Search(BasicProcessor, ABC):
 				if self.interrupted:
 					raise ProcessorInterruptedException("Interrupted while writing results to file")
 
-				# if pseudo/anonymising, filter data recursively
-				if self.parameters.get("pseudonymise") == "pseudonymise":
-					item = dict_search_and_update(item, ["author*"], hash_cache.update_cache)
-				elif self.parameters.get("anonymise") == "anonymise":
-					item = dict_search_and_update(item, ["author*"], lambda v: "REDACTED")
+				# hash or remove the author's details, if asked for; this looks
+				# through the whole item, however deeply nested
+				if author_filter:
+					item = author_filter.filter_item(item)
 
 				outfile.write(json.dumps(item) + "\n")
 				processed += 1
+
+		# an empty dataset has nothing to replace, which says nothing about
+		# whether the field names were right, so do not record that
+		if author_filter and processed:
+			self.dataset.author_info_replaced = author_filter.report()
 
 		return processed
 

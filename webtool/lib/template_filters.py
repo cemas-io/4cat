@@ -1,6 +1,7 @@
 import datetime
 
 import json
+import markdown2
 import ural
 import uuid
 import math
@@ -12,25 +13,27 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 from webtool.lib.helpers import parse_markdown
-from common.lib.helpers import timify, ellipsiate
+from common.lib.helpers import timify, ellipsiate, is_web_url, split_urls, link_urls_in_text, link_urls_in_html
 
 from flask import current_app, g
+from markupsafe import escape
 from flask_login import current_user
-from ural import urls_from_text
 from jinja2.exceptions import TemplateNotFound
 
 @current_app.template_filter('datetime')
 def _jinja2_filter_datetime(date, fmt=None, wrap=True):
+    # templates mark the result as safe HTML, so a value that is not a date
+    # is escaped before it is returned as it is
     if isinstance(date, str):
         try:
             date = int(date)
         except ValueError:
-            return date
+            return escape(date)
 
     try:
         date = datetime.datetime.utcfromtimestamp(date)
-    except (ValueError, OverflowError):
-        return date
+    except (ValueError, OverflowError, TypeError):
+        return escape(date)
 
     format = "%d %b %Y" if not fmt else fmt
     formatted = date.strftime(format)
@@ -143,26 +146,43 @@ def _jinja2_add_colours(data):
 @current_app.template_filter("add_ahref")
 def _jinja2_filter_add_ahref(content, ellipsiate=0):
     """
-    Add HTML links to text
+    Turn the URLs in a text into links, as safe HTML
 
-    Replaces URLs with a clickable link
+    See `link_urls_in_text`. The text is escaped here, so use this on plain
+    text rather than on HTML. Line breaks are shown as `<br>`.
 
-    :param str content:  Text to parse
-    :return str:  Parsed text
+    :param content:  Text to add links to
+    :param int ellipsiate:  Shorten link texts that are longer than this; 0 to never shorten them
+    :return str:  HTML
     """
-    try:
-        content = str(content)
-    except ValueError:
-        return content
+    return link_urls_in_text(content, max_length=ellipsiate, line_breaks=True)
 
-    for link in set(ural.urls_from_text(str(content))):
-        if ellipsiate > 0:
-            link_text = _jinja2_filter_ellipsiate(link, ellipsiate, True, "[&hellip;]")
-        else:
-            link_text = link
-        content = content.replace(link, f'<a href="{link.replace("<", "%3C").replace(">", "%3E").replace(chr(34), "%22")}" rel="external">{link_text}</a>')
 
-    return content
+@current_app.template_filter("web_url")
+def _jinja2_filter_web_url(url):
+    """
+    Give a URL from a dataset to use as a link address
+
+    A field in a dataset can hold anything, such as javascript:alert(1), which
+    runs code when the link is clicked. So only web addresses (http:// and
+    https://) are kept; anything else becomes `#`, a link that goes nowhere.
+
+    :param url:  URL to link to
+    :return str:  The URL, or `#`
+    """
+    url = str(url).strip()
+    return url if is_web_url(url) else "#"
+
+
+@current_app.template_filter("split_urls")
+def _jinja2_filter_split_urls(urls):
+    """
+    Split a list of URLs separated by commas or line breaks; see `split_urls`
+
+    :param str urls:  URLs
+    :return list:  The separate URLs
+    """
+    return split_urls(str(urls))
 
 
 @current_app.template_filter("add_base_url")
@@ -194,6 +214,25 @@ def _jinja2_filter_markdown(text, trim_container=False):
 @current_app.template_filter('isbool')
 def _jinja2_filter_isbool(value):
     return isinstance(value, bool)
+
+@current_app.template_filter('propmap')
+def _jinja2_filter_propmap(data, property, default=None):
+    """
+    Select a property from a sequence of dicts
+
+    To map `{a: b: {prop: value}}` to `{a: value}` for a given `prop`. If
+    `data` is a dict, preserve key:value pairs. If the property does not exist
+    in a sequence item, use the `default` value.
+
+    :param data:  Sequence or dict to map
+    :param property:  Property to use for mapping
+    :param default:  Value to use if property does not exist in item
+    :return:  Mapped sequence or dict
+    """
+    if type(data) is dict:
+        return {k: v.get(property, default) for k, v in data.items()}
+    else:
+        return [v.get(property, default) for v in data.values()]
 
 @current_app.template_filter('json')
 def _jinja2_filter_json(data):
@@ -248,7 +287,6 @@ def _jinja2_filter_extension_to_noun(ext):
 def _jinja2_filter_ellipsiate(*args, **kwargs):
     return ellipsiate(*args, **kwargs)
 
-
 @current_app.template_filter('chan_image')
 def _jinja2_filter_chan_image(tim, ext, board):
 
@@ -260,92 +298,68 @@ def _jinja2_filter_chan_image(tim, ext, board):
     else:
         return f"https://desu-usergeneratedcontent.xyz/{board}/image/{tim[:4]}/{tim[4:6]}/{tim}{ext}"
 
-@current_app.template_filter('social_mediafy')
-def _jinja2_filter_social_mediafy(body: str, datasource="") -> str:
+@current_app.template_filter("social_mediafy")
+def _jinja2_filter_social_mediafy(body, datasource="", markdown=False, line_breaks=False) -> str:
     """
-    Adds links to a text body with hashtags, @-mentions, and URLs.
-    A data source must be given to generate the correct URLs.
+    Turn the URLs, hashtags and @-mentions in a post's text into links, as safe HTML
 
-    :param str body:  Text to parse
-    :param str datasource:  Name of the data source (e.g. "twitter")
+    Hashtags and @-mentions link to the platform the post comes from, so the
+    data source must be given for those. Everything in the text is escaped,
+    so HTML in a post is shown as it is written instead of being used.
 
-    :return str:  Parsed text
+    :param body:  Text of a post
+    :param str datasource:  Data source the post comes from
+    :param bool markdown:  The text is Markdown, as Tumblr's is. It is turned
+    into HTML with the HTML in it escaped, and links that could run code
+    (such as javascript:) made to lead nowhere.
+    :param bool line_breaks:  Show line breaks in plain text as `<br>`
+    :return str:  HTML
     """
-
-    if not datasource:
-        return body
-
     if not body:
-        return body
+        return ""
 
     # Base URLs after which tags and @-mentions follow, per platform
     base_urls = {
-        "twitter": {
-            "hashtag": "https://x.com/hashtag/",
-            "mention": "https://x.com/"
-        },
+        "twitter": {"hashtag": "https://x.com/hashtag/", "mention": "https://x.com/"},
         "tiktok": {
             "hashtag": "https://tiktok.com/tag/",
-            "mention": "https://tiktok.com/@"
+            "mention": "https://tiktok.com/@",
         },
         "instagram": {
-            "hasthag": "https://instagram.com/explore/tags/",
-            "mention": "https://instagram.com/"
+            "hashtag": "https://instagram.com/explore/tags/",
+            "mention": "https://instagram.com/",
         },
-        "tumblr": {
-            "mention": "https://tumblr.com/",
-            "markdown": True
-            # Hashtags aren't linked in the post body
-        },
+        "tumblr": {"mention": "https://tumblr.com/"},
         "linkedin": {
             "hashtag": "https://linkedin.com/feed/hashtag/?keywords=",
-            "mention": "https://linkedin.com/in/"
+            "mention": "https://linkedin.com/in/",
         },
-        "telegram": {
-            "mention": "https://t.me/"
-        },
+        "telegram": {"mention": "https://t.me/"},
         "bsky": {
             "hashtag": "https://bsky.app/hashtag/",
             "mention": "https://bsky.app/profile/",
-        }
+        },
     }
 
-    # Supported data sources
-    known_datasources = list(base_urls.keys())
-    datasource = datasource.replace("-search", "").replace("-import", "")
+    datasource = (datasource or "").replace("-search", "").replace("-import", "")
+    platform = base_urls.get(datasource, {})
 
-    if datasource not in known_datasources:
-        return body
+    # a hashtag or @-mention starts after a space or punctuation, not within
+    # a word or e-mail address
+    other_links = {}
+    if "hashtag" in platform:
+        other_links[r"(?<!\w)#\w+"] = lambda tag: platform["hashtag"] + tag[1:]
+    if "mention" in platform:
+        mention_pattern = r"(?<!\w)@[\w.-]+" if datasource == "bsky" else r"(?<!\w)@[\w-]+"
+        other_links[mention_pattern] = lambda mention: platform["mention"] + mention[1:]
 
-    # Add URL links
-    if not base_urls[datasource].get("markdown"):
-        for url in urls_from_text(body):
-            body = re.sub(url, "<a href='%s' target='_blank'>%s</a>" % (url, url), body)
+    if markdown:
+        # with code-friendly, an underscore does not make italics, so URLs
+        # with underscores in them stay whole; italics use * instead
+        body_html = markdown2.markdown(str(body), safe_mode="escape", extras=["code-friendly"])
+        return link_urls_in_html(body_html, other_links, new_tab=True)
 
-    # Add hashtag links
-    if "hashtag" in base_urls[datasource]:
-        tags = re.findall(r"#[\w0-9]+", body)
-        # We're sorting tags by length so we don't incorrectly
-        # replace tags that are a substring of another, longer tag.
-        tags = sorted(tags, key=lambda x: len(x), reverse=True)
-        for tag in tags:
-            # Match the string, but not if it's preceded by a >, which indicates that we've already added an anchor tag.
-            body = re.sub(r"(?<!'>)(" + tag + ")",
-                          "<a href='%s' target='_blank'>%s</a>" % (base_urls[datasource]["hashtag"] + tag[1:], tag),
-                          body)
-
-    # Add @-mention links
-    if "mention" in base_urls[datasource]:
-        if datasource == "bsky":
-            mentions = re.findall(r"@[\w0-9-.]+", body)
-        else:
-            mentions = re.findall(r"@[\w0-9-]+", body)
-        mentions = sorted(mentions, key=lambda x: len(x), reverse=True)
-        for mention in mentions:
-            body = re.sub(r"(?<!>)(" + mention + ")", "<a href='%s' target='_blank'>%s</a>" % (
-                base_urls[datasource]["mention"] + mention[1:], mention), body)
-
-    return body
+    return link_urls_in_text(body, line_breaks=line_breaks, other_links=other_links, new_tab=True)
 
 
 @current_app.template_filter('string_counter')
@@ -411,6 +425,18 @@ def _jinja2_filter_parameter_str(url):
 
     return params
 
+@current_app.template_filter("hostname")
+def _jinja2_filter_hostname(url: str) -> str:
+    """
+    For a URL, return the hostname
+
+    If no hostname is found, return the original value
+
+    :param str url:
+    :return str:
+    """
+    return ural.get_hostname(url) or url
+
 
 @current_app.template_filter("explorer_css")
 def explorer_css(datasource, scope_class="explorer-content-container"):
@@ -443,6 +469,32 @@ def explorer_css(datasource, scope_class="explorer-content-container"):
 @current_app.template_filter('hasattr')
 def _jinja2_filter_hasattr(obj, attribute):
     return hasattr(obj, attribute)
+
+@current_app.template_filter('debug')
+def _jinja2_filter_debug(value):
+    print(value)
+    
+@current_app.template_global("displayable_parameters")
+def _jinja2_global_displayable_parameters(item, config=None):
+    """
+    Return a dataset's parameters annotated with the producing processor's
+    options schema, suitable for rendering in the UI's parameter panel.
+
+    Sourced from the producer processor (via `get_producer_processor`) so
+    labels/tooltips survive an `adopt_type` rewrite. Sensitive options and
+    parameters absent from the schema are filtered out.
+
+    Usage: {% for entry in displayable_parameters(item, config=__config) %}
+    """
+    producer = item.get_producer_processor()
+    if not producer:
+        return []
+    options = producer.get_options(parent_dataset=item.top_parent(), config=config)
+    return [
+        {"key": k, "value": v, "schema": options[k]}
+        for k, v in item.parameters.items()
+        if k in options and v != "" and not options[k].get("sensitive")
+    ]
 
 @current_app.context_processor
 def inject_now():

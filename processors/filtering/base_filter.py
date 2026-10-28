@@ -4,8 +4,11 @@ Base filter class to handle filetypes
 import abc
 import csv
 import json
+import shutil
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
+from common.lib.dataset import StatusType
 
 __author__ = "Dale Wahl"
 __credits__ = ["Dale Wahl"]
@@ -26,15 +29,8 @@ class BaseFilter(BasicProcessor):
 
     item_ids = []
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        This is meant to be inherited by other child classes
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return False
+    # Abstract base filter; not runnable on its own (empty type set never matches)
+    compatibility = Compatibility(types=set())
 
     def process(self):
         """
@@ -54,6 +50,7 @@ class BaseFilter(BasicProcessor):
         # Check if we need to copy over annotations
         copy_annotations = True if self.source_dataset.num_annotations() > 0 else False
 
+        zip_file = False
         with self.dataset.get_results_path().open("w", encoding="utf-8", **kwargs) as outfile:
 
             writer = None
@@ -73,6 +70,12 @@ class BaseFilter(BasicProcessor):
                     writer.writerow(item_original)
                 elif parent_extension == "ndjson":
                     outfile.write(json.dumps(item_original) + "\n")
+                elif parent_extension == "zip":
+                    if not zip_file:
+                        staging_area = self.dataset.get_staging_area()
+                        zip_file = True
+                    # copy the file from the source dataset to the new dataset
+                    shutil.copy2(item.file, staging_area)
                 else:
                     raise NotImplementedError("Parent datasource of type %s cannot be filtered" % parent_extension)
 
@@ -89,7 +92,24 @@ class BaseFilter(BasicProcessor):
             return
 
         self.dataset.update_label(f"({self.title}) {self.source_dataset.get_label()}")
-        self.dataset.finish(num_posts)
+
+        # a filter can end with a warning, e.g. that some matching items were
+        # left out; finish with that warning rather than as a plain success
+        warning = None
+        if self.dataset.data.get("status_type") == StatusType.WARNING.value:
+            warning = self.dataset.get_status()
+
+        # Write the archive if needed and finish the dataset
+        if zip_file:
+            # check for metadata file and copy it over if it exists
+            metadata_file = self.extract_archived_file_by_name(".metadata.json", self.source_dataset.get_results_path())
+            if metadata_file:
+                shutil.copy2(metadata_file, staging_area)
+            self.write_archive_and_finish(staging_area, num_posts, warning=warning)
+        elif warning:
+            self.dataset.finish_with_warning(num_posts, warning)
+        else:
+            self.dataset.finish(num_posts)
 
     def after_process(self):
         super().after_process()

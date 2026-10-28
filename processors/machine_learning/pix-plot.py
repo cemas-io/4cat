@@ -3,7 +3,7 @@ Create an PixPlot of downloaded images
 """
 import shutil
 import json
-import ural
+import html
 from datetime import datetime
 import csv
 import os
@@ -11,8 +11,9 @@ from urllib.parse import unquote
 from werkzeug.utils import secure_filename
 
 from common.lib.dmi_service_manager import DmiServiceManager, DsmOutOfMemory, DmiServiceManagerException
-from common.lib.helpers import UserInput, ellipsiate
+from common.lib.helpers import UserInput, link_urls_in_text
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 __author__ = "Dale Wahl"
 __credits__ = ["Dale Wahl"]
@@ -33,7 +34,8 @@ class PixPlotGenerator(BasicProcessor):
                   "algorithmically grouped by similarity."
     extension = "html"  # extension of result file, used internally and in UI
 
-    followups = []
+    # image datasets (image archives or image-downloader output), when PixPlot is enabled
+    compatibility = Compatibility(media_types={"image"}, type_prefixes={"image-downloader"}, required_settings={"dmi-service-manager.db_pixplot_enabled", "dmi-service-manager.ab_server_address"})
 
     references = [
         "[PixPlot](https://pixplot.io/)",
@@ -63,6 +65,18 @@ class PixPlotGenerator(BasicProcessor):
         },
     }
 
+    @classmethod
+    def get_queue_id(cls, remote_id, details, dataset) -> str:
+        """
+        Shared queue for locally hosted models
+
+        :param str remote_id:  Job item ID
+        :param dict details:  Job details
+        :param DataSet dataset:  Dataset to run job for
+        :return:
+        """
+        # Unique queue for locally hosted models; used by other local model processors as well
+        return "local_models" 
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -133,18 +147,6 @@ class PixPlotGenerator(BasicProcessor):
 
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on token sets;
-        Checks if pix-plot.server_url set
-
-        :param module: Dataset or processor to determine compatibility with
-        """
-        return config.get("dmi-service-manager.db_pixplot_enabled", False) and \
-               config.get("dmi-service-manager.ab_server_address", False) and \
-               (module.get_media_type() == "image" or module.type.startswith("image-downloader"))
-
     def process(self):
         """
         This takes a 4CAT results file as input, copies the images to a temp
@@ -154,8 +156,7 @@ class PixPlotGenerator(BasicProcessor):
 
         # Are there any available images?
         if self.source_dataset.num_rows == 0:
-            self.dataset.update_status("No images available to render to PixPlot.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No images available to render to PixPlot.")
             return
 
         # Unpack the images into a staging_area
@@ -171,9 +172,8 @@ class PixPlotGenerator(BasicProcessor):
 
         # Check to ensure enough photos will be uploaded to create a PixPlot
         if total_image_files < self.min_photos_needed:
-            self.dataset.update_status(
-                "Minimum of %i photos needed for a PixPlot to be created" % self.min_photos_needed, is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty(
+                f"Minimum of {self.min_photos_needed} photos needed for a PixPlot to be created")
             return
 
         # Gather metadata
@@ -228,7 +228,7 @@ class PixPlotGenerator(BasicProcessor):
         dmi_service_manager.process_results(output_dir)
 
         # Results HTML file redirects to output_dir/index.html
-        plot_url = ('https://' if self.config.get("flask.https") else 'http://') + self.config.get("flask.server_name") + '/result/' + f"{os.path.relpath(self.dataset.get_results_folder_path(), self.dataset.folder)}/index.html"
+        plot_url = ('https://' if self.config.get("flask.https") else 'http://') + self.config.get("flask.server_name") + '/download/' + f"{self.dataset.key}/?query_file={self.dataset.get_results_folder_path().name}/index.html"
         html_file = self.get_html_page(plot_url)
 
         # Write HTML file
@@ -332,10 +332,10 @@ class PixPlotGenerator(BasicProcessor):
                     ordered_descriptions = ['id', 'timestamp', 'subject', 'body', 'author']
                     for detail in ordered_descriptions:
                         if post.get(detail):
-                            image['description'] += '<p><span class="fieldname">' + detail + '</span>' + self.make_nice_link(post.get(detail)) + '</p>'
+                            image['description'] += '<p><span class="fieldname">' + html.escape(detail) + '</span>' + link_urls_in_text(post.get(detail), max_length=50, line_breaks=True) + '</p>'
                     for key, value in post.items():
                         if key not in ordered_descriptions:
-                            image['description'] += '<p><span class="fieldname">' + key + '</span> ' + self.make_nice_link(value) + '</p>'
+                            image['description'] += '<p><span class="fieldname">' + html.escape(str(key)) + '</span> ' + link_urls_in_text(value, max_length=50, line_breaks=True) + '</p>'
 
                     # Add tags or hashtags
                     if image['tags']:
@@ -382,6 +382,11 @@ class PixPlotGenerator(BasicProcessor):
             rows_written = 0
             for image in images.values():
                 rows_written += 1
+                # PixPlot shows the description after decoding its %-codes
+                # (with JavaScript's decodeURIComponent). Writing each % as
+                # %25 makes that give back exactly this HTML, and keeps a lone
+                # %, as in "50% off", from stopping the description showing
+                image['description'] = image['description'].replace('%', '%25')
                 writer.writerow(image)
 
         self.dataset.update_status("Metadata.csv created")
@@ -404,24 +409,3 @@ class PixPlotGenerator(BasicProcessor):
         for i in invalid_chars:
             s = s.replace(i, '')
         return s
-
-    def make_nice_link(self, content):
-        """
-        Add HTML links to text
-
-        Replaces URLs with a clickable link
-
-        :param str content:  Text to parse
-        :return str:  Parsed text
-        """
-        try:
-            content = str(content)
-        except ValueError:
-            return content
-
-        for link in set(ural.urls_from_text(content)):
-            link_text = ellipsiate(link, 50, True, "[&hellip;]")
-            content = content.replace(link,
-                                      f'<a href="{link.replace("<", "%3C").replace(">", "%3E").replace(chr(34), "%22")}" rel="external">{link_text}</a>')
-
-        return content

@@ -10,19 +10,21 @@ import csv
 import os
 
 from flask import Blueprint, current_app, jsonify, request, render_template, render_template_string, redirect, url_for, flash, \
-	get_flashed_messages, send_from_directory, g
+	get_flashed_messages, send_from_directory, stream_with_context, g
 from flask_login import login_required, current_user
 
 from webtool.lib.helpers import error, setting_required, parse_markdown
 
 from common.lib.exceptions import QueryParametersException, JobNotFoundException, \
-	QueryNeedsExplicitConfirmationException, QueryNeedsFurtherInputException, DataSetException
+	QueryNeedsExplicitConfirmationException, QueryNeedsFurtherInputException, DataSetException, \
+	DataSetNotFoundException
 from common.lib.queue import JobQueue
 from common.lib.job import Job
 from common.lib.dataset import DataSet
-from common.lib.helpers import UserInput, call_api
+from common.lib.helpers import UserInput, call_api, get_software_commit, get_software_version, get_git_branch
 from common.lib.user import User
 from backend.lib.worker import BasicWorker
+from common.lib.item_mapping import MissingMappedField
 
 component = Blueprint("toolapi", __name__)
 api_ratelimit = current_app.limiter.shared_limit("3 per second", scope="api")
@@ -31,6 +33,21 @@ API_SUCCESS = 200
 API_FAIL = 404
 
 csv.field_size_limit(1024 * 1024 * 1024)
+
+def _get_search_class(modules, datasource_id):
+	"""
+	Look up the search/import class for a datasource.
+
+	Abstracts the ModuleCollector convention where worker keys append a suffix
+	to the datasource ID. Most use `-search`, some (e.g. twitter-import) use
+	`-import`. Returns None if no matching worker is found.
+
+	TODO: ModuleCollector should expose this directly.
+	"""
+	return (
+		modules.workers.get(f"{datasource_id}-search")
+		or modules.workers.get(f"{datasource_id}-import")
+	)
 
 @component.route("/api/")
 @api_ratelimit
@@ -57,15 +74,52 @@ def openapi_specification(api_id="all"):
 	return jsonify(current_app.openapi.generate(g.config, api_id))
 
 
+@component.route('/api/version.json')
+@api_ratelimit
+@login_required
+def api_version():
+	"""
+	Get 4CAT version information
+
+	Reports the migrated-to release version, the version of the checked-out
+	code, and (if 4CAT is running from a git checkout) the current commit
+	hash, origin repository URL, and branch. The repository URL can be used
+	to verify which fork an instance is running.
+
+	:return: Flask JSON response
+	"""
+	commit, repository = get_software_commit()
+
+	code_version_file = g.config.get("PATH_ROOT").joinpath("VERSION")
+	if code_version_file.exists():
+		with code_version_file.open() as infile:
+			code_version = infile.readline().strip()
+	else:
+		code_version = ""
+
+	response = {
+		"code": API_SUCCESS,
+		"items": {
+			"version": get_software_version(),
+			"code_version": code_version,
+			"commit": commit,
+			"repository": repository,
+			"branch": get_git_branch(),
+		}
+	}
+
+	return jsonify(response)
+
+
 @component.route('/api/status.json')
 @api_ratelimit
+@login_required
 def api_status():
 	"""
 	Get service status
 
 	:return: Flask JSON response
 	"""
-
 	# get job stats
 	queue = JobQueue(logger=g.log, database=g.db)
 	jobs = queue.get_all_jobs()
@@ -97,6 +151,7 @@ def api_status():
 	}
 
 	return jsonify(response)
+
 
 @component.route("/api/available-processors/<string:dataset_key>/")
 @login_required
@@ -171,7 +226,7 @@ def get_processor_options(processor_type, dataset_id=None):
 			return error(404, message="Dataset '%s' does not exist" % dataset_id)
 		
 		# Check compatibility of processor with dataset
-		if hasattr(processor, "is_compatible_with") and not processor.is_compatible_with(dataset, g.config):
+		if not processor.is_compatible_with(dataset, g.config):
 			return error(422, message="Processor '%s' is not compatible with dataset '%s'" % (processor_type, dataset_id))
 
 		worker_options = processor.get_options(dataset, g.config)
@@ -429,7 +484,20 @@ def queue_dataset():
 	# are sent for validation. This makes the front-end re-submit the full
 	# query
 	if not has_confirm:
-		return jsonify({"status": "validated", "keep": sanitised_query})
+		# Re-serialize only OPTION_TEXT_JSON values back to JSON strings before
+		# returning keep. parse_all parses these into Python lists/dicts, but
+		# jsonify turns them into JS arrays/objects. FormData.set() then coerces
+		# those to "[object Object],..." on the for-real re-submission.
+		# (Other list/dict fields, e.g. parsed URL lists are not touched.)
+		json_option_keys = {
+			option for option, settings in search_worker.get_options(None, g.config).items()
+			if settings.get("type") == UserInput.OPTION_TEXT_JSON
+		}
+		keep = {
+			k: json.dumps(v) if k in json_option_keys and isinstance(v, (list, dict)) else v
+			for k, v in sanitised_query.items()
+		}
+		return jsonify({"status": "validated", "keep": keep})
 
 	sanitised_query["datasource"] = datasource_id
 	sanitised_query["type"] = search_worker_id
@@ -441,7 +509,11 @@ def queue_dataset():
 		sanitised_query["email-complete"] = request.form.to_dict().get("email-user", False)
 
 	# unchecked checkboxes do not send data in html forms, so key will not exist if box is left unchecked
-	is_private = bool(request.form.get("make-private", False))
+	# users who are not allowed to make datasets public never get the checkbox, and always get a private dataset
+	if not g.config.get("privileges.can_make_dataset_public"):
+		is_private = True
+	else:
+		is_private = bool(request.form.get("make-private", True))
 
 	extension = search_worker.extension if hasattr(search_worker, "extension") else "csv"
 
@@ -480,6 +552,10 @@ def queue_dataset():
 def check_dataset():
 	"""
 	Check dataset status
+
+	Works for any dataset, including top-level datasets. For a child dataset
+	shown in its parent's list of results, `/api/check-processors/` also
+	returns the HTML for that entry.
 
 	Requires authentication by logging in or providing a valid access token.
 
@@ -685,24 +761,29 @@ def nuke_dataset(key=None, reason=None):
 	for child in children:
 		try:
 			job = Job.get_by_remote_ID(child.key, database=g.db, jobtype=child.type)
-			call_api("cancel-job", {"remote_id": child.key, "jobtype": dataset.type, "level": BasicWorker.INTERRUPT_CANCEL})
-			job.finish()
-			child.delete()
 		except JobNotFoundException:
-			pass
-		except ConnectionRefusedError:
-			return error(500,
-						 message="The 4CAT backend is not available. Try again in a minute or contact the instance maintainer if the problem persists.")
+			continue
+
+		# only a claimed job has a worker running that needs to be stopped
+		if job.is_claimed:
+			api_response = call_api("cancel-job", {"remote_id": child.key, "jobtype": child.type, "level": BasicWorker.INTERRUPT_CANCEL})
+			if api_response["status"] != "success":
+				return error(500,
+							 message="The 4CAT backend is not available. Try again in a minute or contact the instance maintainer if the problem persists.")
+
+		job.finish()
+		child.delete()
 
 	# now cancel and delete the job for this one (if it exists)
 	try:
 		job = Job.get_by_remote_ID(dataset.key, database=g.db, jobtype=dataset.type)
-		call_api("cancel-job", {"remote_id": dataset.key, "jobtype": dataset.type, "level": BasicWorker.INTERRUPT_CANCEL})
+		if job.is_claimed:
+			api_response = call_api("cancel-job", {"remote_id": dataset.key, "jobtype": dataset.type, "level": BasicWorker.INTERRUPT_CANCEL})
+			if api_response["status"] != "success":
+				return error(500,
+							 message="The 4CAT backend is not available. Try again in a minute or contact the instance maintainer if the problem persists.")
 	except JobNotFoundException:
 		pass
-	except ConnectionRefusedError:
-		return error(500,
-					 message="The 4CAT backend is not available. Try again in a minute or contact the instance maintainer if the problem persists.")
 
 	# wait for the dataset to actually be cancelled
 	time.sleep(2)
@@ -1044,7 +1125,8 @@ def toggle_private(key):
 	Private datasets cannot be viewed by users that are not an admin or the
 	owner of the dataset. An exception is datasets assigned to the user
 	'anonymous', which can be viewed by anyone. Only admins and owners can
-	toggle private status of a dataset.
+	toggle private status of a dataset. Making a dataset public furthermore
+	requires the 'can make datasets public' privilege.
 
 	:param str key: Key of the dataset to mark as (not) private
 
@@ -1052,6 +1134,8 @@ def toggle_private(key):
 	:return-schema: {type=object,properties={success={type=boolean},is_private={type=boolean}}}
 
 	:return-error 404:  If the dataset key was not found
+	:return-error 403:  If the user may not manipulate this dataset, or may not
+	                    make datasets public
 	"""
 	try:
 		dataset = DataSet(key=key, db=g.db, modules=g.modules)
@@ -1060,6 +1144,11 @@ def toggle_private(key):
 
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, error="This dataset is private")
+
+	# making a dataset public requires a privilege; making one private is always allowed, so that
+	# datasets that are already public can be hidden again
+	if dataset.is_private and not g.config.get("privileges.can_make_dataset_public"):
+		return error(403, error="You are not allowed to make datasets public.")
 
 	# apply status to dataset and all children
 	dataset.is_private = not dataset.is_private
@@ -1242,7 +1331,18 @@ def queue_processor(key=None, processor=None):
 @current_app.openapi.endpoint("tool")
 def check_processor():
 	"""
-	Check processor status
+	Check the status of child datasets
+
+	This is only for datasets that are the child of another dataset. The
+	returned HTML shows each dataset as an entry in its parent's list of
+	results on a result page, so it needs the dataset's parent. To check the
+	status of a top-level dataset, use `/api/check-query/`.
+
+	Keys that cannot be shown this way are left out of the result: top-level
+	datasets, datasets whose parent no longer exists, datasets that do not
+	exist (any more), and datasets the user cannot access. The one top-level
+	dataset that is included is the copy a filter makes of its result; it is
+	shown in the place of the filter dataset it was copied from.
 
 	:request-param str subqueries:  A JSON-encoded list of dataset keys to get
 	                                the status of
@@ -1293,19 +1393,37 @@ def check_processor():
 		else:
 			genealogy = dataset.get_genealogy()
 
+		if len(genealogy) < 2:
+			# get_genealogy() stops at a parent that no longer exists. Without
+			# its parent, the dataset cannot be shown as a child, just like a
+			# top-level dataset above
+			g.log.warning(f"Parent of dataset {dataset.key} not found; cannot render child view. Skipping...")
+			continue
+
 		parent = genealogy[-2]
 		top_parent = genealogy[0]
 
-		children.append({
-			"key": dataset.key,
-			"finished": dataset.is_finished(),
-			"progress": round(dataset.get_progress() * 100),
-			"html": render_template("components/result-child.html", child=dataset, dataset=parent,
-                                    query=dataset.get_genealogy()[0], parent_key=top_parent.key,
-                                    processors=g.modules.processors),
-			"resultrow_html": render_template("components/result-result-row.html", dataset=top_parent),
-			"url": "/result/" + dataset.data["result_file"]
-		})
+		try:
+			children.append({
+				"key": dataset.key,
+				"finished": dataset.is_finished(),
+				"progress": round(dataset.get_progress() * 100),
+				"html": render_template("components/result-child.html", child=dataset, dataset=parent,
+                                        query=dataset.get_genealogy()[0], parent_key=top_parent.key,
+                                        processors=g.modules.processors),
+				"resultrow_html": render_template("components/result-result-row.html", dataset=top_parent),
+				"url": url_for("dataset.get_result", dataset_key=dataset.key, query_file=dataset.result_file),
+				"annotation_fields": {
+					field_id: {"label": field_data.get("label", "")}
+					for field_id, field_data in (top_parent.annotation_fields or {}).items()
+				}
+			})
+		except DataSetNotFoundException:
+			# The dataset was deleted while it was being rendered, e.g. by a
+			# delete request sent from the same page while it was still
+			# checking this dataset. Skip it, as if it had been gone from the
+			# start
+			pass
 
 	return jsonify(children)
 
@@ -1374,8 +1492,14 @@ def export_packed_dataset(key=None, component=None):
 	except DataSetException:
 		return error(404, error="Dataset not found.")
 
-	if not current_user.can_access_dataset(dataset=dataset, role="owner"):
-		return error(403, error=f"You cannot export this dataset. {current_user}")
+	# an export holds the dataset's full database record, including all
+	# parameters and the log, so viewing access is not enough: only owners and
+	# users who may view or manipulate all datasets can export it. this also
+	# applies to public datasets.
+	if not (g.config.get("privileges.admin.can_manipulate_all_datasets")
+			or g.config.get("privileges.can_view_private_datasets")
+			or dataset.is_accessible_by(current_user, "owner")):
+		return error(403, error="You cannot export this dataset.")
 
 	if not dataset.is_finished():
 		return error(403, error="You cannot export unfinished datasets.")
@@ -1396,3 +1520,218 @@ def export_packed_dataset(key=None, component=None):
 
 	else:
 		return error(406, error="Dataset component unknown")
+
+@component.route("/api/datasources/")
+@api_ratelimit
+@current_app.openapi.endpoint("tool")
+def list_datasources():
+	"""
+	List all available datasources with map_item support.
+
+	Returns all datasources that have a map_item function, including a flag
+	indicating if they're from Zeeschuimer. Caller can filter as needed.
+
+	:return: JSON object with array of datasource metadata
+
+	:return-schema: {
+		type=object,
+		properties={
+			datasources={
+				type=array,
+				items={
+					type=object,
+					properties={
+						id={type=string},
+						name={type=string},
+						has_map_item={type=boolean},
+						is_from_zeeschuimer={type=boolean}
+					}
+				}
+			}
+		}
+	}
+	"""
+	
+	available = []
+	for datasource_id, metadata in g.modules.datasources.items():
+		search_class = _get_search_class(g.modules, datasource_id)
+		if not search_class:
+			continue
+
+		available.append({
+			"id": datasource_id,
+			"name": metadata.get("name", datasource_id),
+			"is_from_zeeschuimer": getattr(search_class, "is_from_zeeschuimer", False),
+			"has_map_item": hasattr(search_class, "map_item") and callable(getattr(search_class, "map_item"))
+		})
+
+	return jsonify({
+		"datasources": sorted(available, key=lambda x: x["id"])
+	}), 200
+
+class MissingMappedFieldEncoder(json.JSONEncoder):
+	"""Custom JSON encoder to serialize MissingMappedField objects."""
+
+	def default(self, obj):
+		if isinstance(obj, MissingMappedField):
+			return {
+				"__missing": True,
+				"value": obj.value
+			}
+		return super().default(obj)
+
+@component.route("/api/dataset/<string:key>/items/", methods=["GET", "HEAD"])
+@api_ratelimit
+@login_required
+@current_app.openapi.endpoint("tool")
+def dataset_items(key):
+	"""
+	Get a dataset's mapped items as JSON.
+
+	Returns the same per-item content as the CSV download at
+	`/mapped-result/<key>/` (datasource `map_item` applied, annotations
+	merged in by default), but as JSON. Two response modes:
+
+	- Default (paginated): a JSON envelope `{key, offset, limit, total,
+	  returned, next_offset, items}`. `next_offset` is `null` on the last
+	  page. Default `limit` is 100, max 1000.
+	- Stream (`?stream=true`): the entire dataset as NDJSON (one JSON
+	  object per line). `offset` and `limit` are ignored.
+
+	Paginated mode re-reads the dataset file from the start on every
+	request (it skips `offset` rows before yielding), so use `?stream=true` 
+	to enumerate the full dataset in one pass.
+
+	ZIP archive datasets are not supported and will return 400; download
+	the archive directly instead.
+
+	Responds to HEAD with the same status code and headers as GET but no
+	body — useful as a cheap metadata probe. Every response carries
+	`X-4CAT-Dataset-Type`, `X-4CAT-Dataset-Datasource`,
+	`X-4CAT-Dataset-Num-Rows`, `X-4CAT-Dataset-Is-Finished`,
+	`X-4CAT-Dataset-Extension`, and `X-4CAT-Dataset-Key`.
+
+	Authenticate via the `Authentication` header or `?access-token` query
+	parameter using a 4CAT access token.
+
+	:param str key: Dataset key.
+	:request-param int ?offset: Skip this many rows before returning items
+	                            (paginated mode only, default 0).
+	:request-param int ?limit: Return at most N items, 1-1000
+	                           (paginated mode only, default 100).
+	:request-param bool ?stream: If truthy, stream the full dataset as
+	                             NDJSON instead of paginating.
+	:request-param bool ?annotations: Include annotation columns
+	                                  (default true).
+	:request-param str ?missing_fields: How to represent fields that were
+	                                    missing in the source data. One of
+	                                    `default` (replace with the
+	                                    datasource's fallback value; the
+	                                    same behavior as the CSV export) or
+	                                    `keep` (preserve as
+	                                    `{"__missing": true, "value": ...}`
+	                                    in the JSON output so the caller
+	                                    can distinguish missing from
+	                                    present). Default `default`.
+	:request-param str ?access-token: Access token; only required if not
+	                                  logged in currently.
+
+	:return: JSON envelope (paginated) or NDJSON stream.
+	:return-error 404: If the dataset does not exist.
+	:return-error 403: If the dataset is private and the caller is not an
+	                   owner.
+	:return-error 400: If query parameters are invalid, or the dataset's
+	                   storage format is not iterable as items (e.g. ZIP).
+	"""
+	try:
+		dataset = DataSet(key=key, db=g.db, modules=g.modules)
+	except DataSetException:
+		return error(404, error="Dataset not found.")
+
+	if dataset.is_private and not (
+			g.config.get("privileges.can_view_private_datasets")
+			or dataset.is_accessible_by(current_user)):
+		return error(403, error="This dataset is private.")
+
+	if dataset.get_extension() == "zip":
+		return error(400, error="ZIP archive datasets cannot be served as JSON items; download the archive directly.")
+
+	# add headers for metadata (useful for HEAD requests and because Stijn hates sharing)
+	headers = {
+		"X-4CAT-Dataset-Key": dataset.key,
+		"X-4CAT-Dataset-Type": dataset.type,
+		"X-4CAT-Dataset-Num-Rows": str(dataset.num_rows),
+		"X-4CAT-Dataset-Is-Finished": "true" if dataset.is_finished() else "false",
+	}
+	datasource = dataset.parameters.get("datasource")
+	if datasource:
+		headers["X-4CAT-Dataset-Datasource"] = datasource
+
+	if request.method == "HEAD":
+		return current_app.response_class(status=200, headers=headers)
+
+	truthy = ("true", "1", "yes")
+	falsy = ("false", "0", "no")
+	stream = request.args.get("stream", "").lower() in truthy
+	include_annotations = request.args.get("annotations", "true").lower() not in falsy
+
+	missing_fields = request.args.get("missing_fields", "default").lower()
+	if missing_fields not in ("default", "keep"):
+		return error(400, error="`missing_fields` must be 'default' or 'keep'")
+
+	iter_kwargs = {
+		"warn_unmappable": False,
+		"get_annotations": include_annotations,
+		"map_missing": missing_fields,
+	}
+
+	if stream:
+		def ndjson_stream():
+			for item in dataset.iterate_items(**iter_kwargs):
+				yield json.dumps(item, cls=MissingMappedFieldEncoder) + "\n"
+
+		return current_app.response_class(
+			stream_with_context(ndjson_stream()),
+			mimetype="application/x-ndjson",
+			headers=headers,
+		)
+
+	# Paginated mode
+	try:
+		offset = int(request.args.get("offset", 0))
+	except ValueError:
+		return error(400, error="`offset` must be an integer")
+	if offset < 0:
+		return error(400, error="`offset` must be non-negative")
+
+	try:
+		limit = int(request.args.get("limit", 100))
+	except ValueError:
+		return error(400, error="`limit` must be an integer")
+
+	MAX_LIMIT = 1000
+	if limit < 1 or limit > MAX_LIMIT:
+		return error(400, error=f"`limit` must be between 1 and {MAX_LIMIT}; use ?stream=true for the full dataset")
+
+	items = list(itertools.islice(
+		dataset.iterate_items(offset=offset, **iter_kwargs),
+		limit
+	))
+
+	total = dataset.num_rows
+	end = offset + len(items)
+	next_offset = end if end < total else None
+
+	return current_app.response_class(
+		json.dumps({
+			"key": dataset.key,
+			"type": dataset.type,
+			"offset": offset,
+			"limit": limit,
+			"total": total,
+			"returned": len(items),
+			"next_offset": next_offset,
+			"items": items,
+		}, cls=MissingMappedFieldEncoder),
+		mimetype="application/json"
+	)

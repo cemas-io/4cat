@@ -1,8 +1,14 @@
+import traceback
+import inspect
 import socket
 import time
 import json
+import sys
+
+from pathlib import Path
 
 from backend.lib.worker import BasicWorker
+from common.lib.helpers import get_software_commit
 from common.lib.job import Job
 from common.lib.exceptions import JobNotFoundException
 
@@ -65,13 +71,13 @@ class InternalAPI(BasicWorker):
 				break
 			except OSError as e:
 				if has_time and not self.interrupted:
-					self.manager.log.info("Could not open port %i yet (%s), retrying in 10 seconds" % (self.port, e))
+					self.manager.log.info(f"Could not open port {self.port} yet ({e}), retrying in 10 seconds")
 					time.sleep(10.0)  # wait a few seconds before retrying
 					continue
-				self.manager.log.error("Port %s is already in use! Local API not available. Check if a residual 4CAT process may still be listening at the port." % self.port)
+				self.manager.log.error(f"Cannot listen at port {self.port} ({e})! Local API not available. Check if a residual 4CAT process may still be listening at the port.")
 				return
-			except ConnectionRefusedError:
-				self.manager.log.error("OS refused listening at port %i! Local API not available." % self.port)
+			except ConnectionRefusedError as e:
+				self.manager.log.error(f"OS refused listening at port {self.port} ({e})! Local API not available.")
 				return
 
 		server.listen()
@@ -79,6 +85,7 @@ class InternalAPI(BasicWorker):
 		self.manager.log.info("Local API listening for requests at %s:%s" % (self.host, self.port))
 
 		# continually listen for new connections
+		client = None
 		while not self.interrupted:
 			try:
 				client, address = server.accept()
@@ -92,6 +99,10 @@ class InternalAPI(BasicWorker):
 			self.api_response(client, address)
 			client.close()
 
+		if client:
+			client.close()
+
+		server.close()
 		self.manager.log.info("Shutting down local API server")
 
 	def api_response(self, client, address):
@@ -137,18 +148,28 @@ class InternalAPI(BasicWorker):
 
 		self.manager.log.debug("Received API request from %s:%s" % address)
 
+		request = None
 		try:
 			payload = json.loads(buffer)
 			if "request" not in payload:
 				raise InternalAPIException
 
-			response = self.process_request(payload["request"], payload)
+			request = payload["request"]
+			response = self.process_request(request, payload)
 			if not response:
 				raise InternalAPIException
 
 			response = json.dumps({"error": False, "response": response})
 		except (json.JSONDecodeError, InternalAPIException):
-			response = json.dumps({"error": "Invalid JSON"})
+			response = json.dumps({"error": "Invalid JSON", "response": None})
+		except Exception as e:
+			# an error while answering one request should not stop the API
+			# worker, because then nothing can reach the backend until it is
+			# restarted - so log it, answer with an error, and keep listening
+			stack = traceback.extract_tb(e.__traceback__)
+			location = "->".join([frame.filename.split("/").pop() + ":" + str(frame.lineno) for frame in stack])
+			self.manager.log.error(f"API request {request} raised exception {e.__class__.__name__}: {e} at {location}", frame=stack)
+			response = json.dumps({"error": f"Internal error ({e.__class__.__name__})", "response": None})
 
 		try:
 			response = client.sendall(response.encode("ascii"))
@@ -180,17 +201,7 @@ class InternalAPI(BasicWorker):
 			self.manager.request_interrupt(job=job, interrupt_level=level)
 			return "OK"
 
-		elif request == "workers":
-			# return the number of workers, sorted by type
-			workers = {}
-			for jobtype in self.manager.worker_pool:
-				workers[jobtype] = len(self.manager.worker_pool[jobtype])
-
-			workers["total"] = sum([workers[workertype] for workertype in workers])
-
-			return workers
-
-		if request == "jobs":
+		elif request == "jobs":
 			# return queued jobs, sorted by type
 			jobs = self.db.fetchall("SELECT * FROM jobs")
 			if jobs is None:
@@ -233,43 +244,108 @@ class InternalAPI(BasicWorker):
 			# all jobs plus, for those that are currently active, some worker
 			# info as well as related datasets. useful to monitor server
 			# activity and judge whether 4CAT can safely be interrupted
-			open_jobs = self.db.fetchall("SELECT jobtype, timestamp, timestamp_claimed, timestamp_lastclaimed, interval, remote_id FROM jobs ORDER BY jobtype ASC, timestamp ASC, remote_id ASC")
+			open_jobs = self.db.fetchall(
+				"SELECT jobtype, queue_id, timestamp, timestamp_claimed, timestamp_lastclaimed, interval, remote_id "
+				"FROM jobs ORDER BY queue_id ASC, jobtype ASC, timestamp ASC, remote_id ASC"
+			)
 			running = []
 			queue = {}
 
+			# get relevant frame stacks
+			frames = sys._current_frames()
+
 			for job in open_jobs:
-				try:
-					worker = list(filter(lambda worker: worker.job.data["jobtype"] == job["jobtype"] and worker.job.data["remote_id"] == job["remote_id"], self.manager.worker_pool.get(job["jobtype"], [])))[0]
-				except IndexError:
-					worker = None
+				# find the worker for this job, if it exists
+				queue_key = job["queue_id"]
+				jobtype = job["jobtype"]
 
-				if not bool(worker):
-					if job["jobtype"] not in queue:
-						queue[job["jobtype"]] = 0
+				worker = None
+				for candidate in self.manager.worker_pool.get(queue_key, []):
+					candidate_data = candidate.job.data
+					if (
+						candidate_data.get("remote_id") == job["remote_id"]
+						# can be various jobtypes in same queue (and theoretically remote_id could be same across jobtypes)
+						and candidate_data.get("jobtype") == jobtype
+					):
+						worker = candidate
+						break
+				
+				# a job's claim flag encodes three states:
+				#   0  -> queued/claimable
+				#  >0  -> claimed (running if a live worker exists, else a likely
+				#        hard-kill zombie)
+				#  -1  -> parked after a crash (Job.STATUS_PARKED); retried on the
+				#        next restart. see Job.park() / BasicWorker.run().
+				timestamp_claimed = job["timestamp_claimed"]
+				is_claimed = timestamp_claimed > 0
+				is_parked = timestamp_claimed == Job.STATUS_PARKED
 
-					queue[job["jobtype"]] += 1
+				if not worker and not is_claimed and not is_parked:
+					# truly queued and waiting to be claimed
+					if jobtype not in queue:
+						queue[jobtype] = 0
+					queue[jobtype] += 1
 				else:
-					if hasattr(worker, "dataset") and worker.dataset:
-						running_key = worker.dataset.key
-						running_user = worker.dataset.creator
-						running_parent = worker.dataset.top_parent().key
-					else:
-						running_key = None
-						running_user = None
-						running_parent = None
+					# has a live worker, or is claimed/parked without one. dataset
+					# resolution is left to the frontend (which treats remote_id as
+					# a dataset key only for processor jobtypes); the API just
+					# reports job state.
+
+					# include the worker stack location, which shows where exactly
+					# the worker is currently executing code
+					stack = []
+					if frames.get(worker.ident):
+						stack = []
+						frame = frames[worker.ident]
+						have_root = False
+						while frame:
+							# each frame has a reference to the parent frame (if there is one)
+							# traverse this stack to construct the actual call stack
+							# only include frames within the 4CAT context
+							code_path = Path(frame.f_code.co_filename)
+							if code_path == Path(inspect.getfile(worker.__class__)):
+								# start the stack trace at the worker's own file
+								have_root = True
+
+							if not have_root or not code_path.is_relative_to(self.config.get("PATH_ROOT")):
+								frame = frame.f_back
+								continue
+
+							extension = ""
+							relative_path = code_path.relative_to(self.config.get("PATH_ROOT"))
+							if code_path.is_relative_to(self.config.get("PATH_EXTENSIONS")):
+								# for extension code, take the extension folder as root
+								relative_path = code_path.relative_to(self.config.get("PATH_EXTENSIONS"))
+								extension = code_path.parts[0]
+								relative_path = relative_path.relative_to(*relative_path.parts[:1])
+
+							stack.append({
+								"path": "/" + str(relative_path),
+								"line": frame.f_lineno,
+								"function": frame.f_code.co_name,
+								"extension": extension
+							})
+							frame = frame.f_back
+						stack = stack[:-2]
 
 					running.append({
-						"type": job["jobtype"],
-						"is_claimed": job["timestamp_claimed"] > 0,
+						"type": jobtype,
+						"queue_id": queue_key,
+						"remote_id": job["remote_id"],
+						"is_claimed": is_claimed,
 						"is_running": bool(worker),
-						"is_processor": hasattr(worker, "dataset"),
+						# Processors have DataSets
+						"is_processor": jobtype in self.modules.processors,
 						"is_recurring": (int(job["interval"]) > 0),
-						"is_maybe_crashed": job["timestamp_claimed"] > 0 and not worker,
-						"dataset_key": running_key,
-						"dataset_user": running_user,
-						"dataset_parent_key": running_parent,
+						"is_parked": is_parked,
+						"is_maybe_crashed": is_claimed and not bool(worker),
+						"code": {
+							"origin": get_software_commit(worker),
+							"location": stack
+						},
 						"timestamp_queued": job["timestamp"],
-						"timestamp_claimed": job["timestamp_lastclaimed"]
+						"timestamp_claimed": timestamp_claimed,
+						"timestamp_lastclaimed": job["timestamp_lastclaimed"],
 					})
 
 			return {

@@ -4,8 +4,9 @@ Retrieve HTML title (and other metadata) for URLs
 import csv
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from backend.lib.proxied_requests import FailedProxiedRequest
-from common.lib.helpers import UserInput
+from common.lib.helpers import UserInput, urls_in_text
 from common.lib.exceptions import ProcessorInterruptedException
 
 import warnings
@@ -31,7 +32,8 @@ class URLFetcher(BasicProcessor):
                    "each URL, optionally following HTTP redirects.")  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
-    followups = []
+    # Allow on top-level CSV/NDJSON datasets
+    compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
 
     config = {
         "url-metadata.timeout": {
@@ -42,17 +44,6 @@ class URLFetcher(BasicProcessor):
             "tooltip": "Time to wait before cancelling a request and potentially trying again"
         }
     }
-
-    @staticmethod
-    def is_compatible_with(module=None, config=None):
-        """
-        Determine compatibility
-
-        :param Dataset module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-        return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -123,7 +114,7 @@ class URLFetcher(BasicProcessor):
         for item in self.source_dataset.iterate_items(self):
             # combine column contents that we need to extract URLs from
             source_text = " ".join([str(item[column]) for column in columns])
-            urls = ural.urls_from_text(source_text)
+            urls = urls_in_text(source_text)
 
             for url in urls:
                 if url not in all_urls:
@@ -194,14 +185,14 @@ class URLFetcher(BasicProcessor):
                 self.dataset.update_status(f"Processed {(urls_failed + urls_success):,} of {len(all_urls):,} URLs")
                 self.dataset.update_progress((urls_failed + urls_success) / len(all_urls))
 
-        # log warning if not everything succeeded
-        if urls_failed:
-            self.dataset.update_status(f"URLs fetched, but {urls_failed:,} URL(s) could not be retrieved. See dataset "
-                                       f"log for details.", is_final=True)
-
         # and write everything to a CSV
-        self.dataset.finish(urls_failed + urls_success)
-        self.job.finish()
+        if urls_failed:
+            # log warning if not everything succeeded
+            self.dataset.finish_with_warning(urls_success, f"{urls_failed:,} URL(s) could not be retrieved. See dataset "
+                                       f"log for details.")
+        else:
+            self.dataset.finish(urls_success)
+            self.job.finish()
 
     @staticmethod
     def stream_url(response, *args, **kwargs):

@@ -4,6 +4,7 @@ Over-time trends
 import re
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput, get_interval_descriptor
 
 __author__ = "Stijn Peeters"
@@ -22,10 +23,10 @@ class OvertimeAnalysis(BasicProcessor):
     description = "Determines the counts over time of particular set of words or phrases."  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
-    followups = []
+    # Allow on top-level CSV/NDJSON datasets
+    compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
 
     references = [
-        "[Hatebase.org](https://hatebase.org)"
         "[\"Salvaging the Internet Hate Machine: Using the discourse of radical online subcultures to identify emergent extreme speech\" - Unblished paper detailing the OILab extreme speech lexigon](https://oilab.eu/texts/4CAT_Hate_Speech_WebSci_paper.pdf)",
     ]
 
@@ -57,10 +58,6 @@ class OvertimeAnalysis(BasicProcessor):
                 "type": UserInput.OPTION_MULTI,
                 "default": [],
                 "options": {
-                    "hatebase-en-unambiguous": "Hatebase.org hate speech list (English, unambiguous terms)",
-                    "hatebase-en-ambiguous": "Hatebase.org hate speech list (English, ambiguous terms)",
-                    "hatebase-it-unambiguous": "Hatebase.org hate speech list (Italian, unambiguous terms)",
-                    "hatebase-it-ambiguous": "Hatebase.org hate speech list (italian, ambiguous terms)",
                     "oilab-extreme-other": "OILab Extreme Speech Lexicon (other)",
                     "oilab-extreme-anticon": "OILab Extreme Speech Lexicon (anti-conservative)",
                     "oilab-extreme-antileft": "OILab Extreme Speech Lexicon (anti-left)",
@@ -74,7 +71,7 @@ class OvertimeAnalysis(BasicProcessor):
                     "oilab-extreme-sexual": "OILab Extreme Speech Lexicon (sexual)",
                     "wildcard": "Match everything (useful as comparison, only has effect when tracking separately)"
                 },
-                "help": "Vocabularies to detect. For explanation, see hatebase.org for the hatebase lexicon and the references of this module for the OILab extreme speech lexicon"
+                "help": "Vocabularies to detect. For explanation, the references of this module for the OILab extreme speech lexicon"
             },
             "vocabulary-custom": {
                 "type": UserInput.OPTION_TEXT,
@@ -83,20 +80,9 @@ class OvertimeAnalysis(BasicProcessor):
             }
         }
 
-    @staticmethod
-    def is_compatible_with(module=None, config=None):
-        """
-        Determine compatibility
-
-        :param Dataset module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-        return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
-
     def process(self):
         """
-        Reads a CSV file, counts occurences of chosen values over all posts,
+        Reads a CSV file, counts occurrences of chosen values over all posts,
         and aggregates the results per chosen time frame
         """
 
@@ -177,8 +163,7 @@ class OvertimeAnalysis(BasicProcessor):
                 try:
                     interval = get_interval_descriptor(post, timeframe)
                 except ValueError as e:
-                    self.dataset.update_status("%s, cannot count posts per %s" % (str(e), timeframe), is_final=True)
-                    self.dataset.update_status(0)
+                    self.dataset.finish_with_error("%s, cannot count posts per %s" % (str(e), timeframe))
                     return
 
                 if interval not in activity[vocabulary_id]:
@@ -203,4 +188,4 @@ class OvertimeAnalysis(BasicProcessor):
         if rows:
             self.write_csv_items_and_finish(rows)
         else:
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No word counts")

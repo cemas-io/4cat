@@ -4,6 +4,7 @@ Convert Clarifai annotations to CSV
 import csv
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -27,15 +28,8 @@ class ConvertClarifaiOutputToCSV(BasicProcessor):
     description = "Convert the Clarifai API output to a simplified CSV file."  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Determine if processor is compatible
-
-        :param module: Module determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.type == "clarifai-api"
+    # Allow processor on Clarifai API output
+    compatibility = Compatibility(types={"clarifai-api"})
 
     def process(self):
         """
@@ -45,8 +39,7 @@ class ConvertClarifaiOutputToCSV(BasicProcessor):
         done = 0
 
         if not self.source_file.exists():
-            self.dataset.update_status("No data was returned by the Clarifai API, so none can be converted.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("No data was returned by the Clarifai API, so none can be converted.")
             return
 
         # recreate CSV file with the new dialect

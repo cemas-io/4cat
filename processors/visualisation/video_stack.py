@@ -8,10 +8,12 @@ assumes that ffprobe is also present in the same location.
 """
 import shutil
 import oslex
+import json
 
 from packaging import version
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility, ExecutableSibling
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.user_input import UserInput
 from common.lib.helpers import get_ffmpeg_version
@@ -35,6 +37,9 @@ class VideoStack(BasicProcessor):
                   "transparently to help visualise similarities. Does not work well with more than a dozen or so " \
                   "videos. Videos are stacked by length, i.e. the longest video is at the 'bottom' of the stack."  # description displayed in UI
     extension = "mp4"  # extension of result file, used internally and in UI
+
+    # Allow on video datasets when ffmpeg and ffprobe are available
+    compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, required_settings={("video-downloader.ffmpeg_path", ExecutableSibling("ffmpeg", "ffprobe"))})
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -98,25 +103,6 @@ class VideoStack(BasicProcessor):
             }
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Determine compatibility
-
-        :param DataSet module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-        if not (module.get_media_type() == "video" or module.type.startswith("video-downloader")):
-            return False
-        else:
-            # Only check these if we have a video dataset
-            # also need ffprobe to determine video lengths
-            # is usually installed in same place as ffmpeg
-            ffmpeg_path = shutil.which(config.get("video-downloader.ffmpeg_path"))
-            ffprobe_path = shutil.which("ffprobe".join(ffmpeg_path.rsplit("ffmpeg", 1))) if ffmpeg_path else None
-            return ffmpeg_path and ffprobe_path
-
     def process(self):
         """
         This takes a zipped set of videos, uses https://pypi.org/project/videohash/ and https://ffmpeg.org/ to collect
@@ -124,8 +110,7 @@ class VideoStack(BasicProcessor):
         """
         # Check processor able to run
         if self.source_dataset.num_rows < 3:
-            self.dataset.update_status("Not enough videos to stack (need at least 2)", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("Not enough videos to stack (need at least 2)")
             return
 
         # Collect parameters
@@ -173,31 +158,34 @@ class VideoStack(BasicProcessor):
         videos = []
 
         # unpack videos and determine length of the video (for sorting)
-        for video in video_dataset.iterate_items(immediately_delete=False):
+        for video in video_dataset.iterate_items(self, immediately_delete=False):
             if self.interrupted:
                 return ProcessorInterruptedException("Interrupted while unpacking videos")
 
-            # skip JSON
-            if video.file.name == '.metadata.json':
+            # skip JSON and yt-dlp file
+            if video.file.name in (".metadata.json", "video_archive"):
                 continue
 
             if len(videos) >= max_videos:
                 break
 
-            video_path = oslex.quote(str(video.file))
-
             # determine length if needed
-            length_command = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
-                              "default=noprint_wrappers=1:nokey=1", video_path]
-            length = self.run_interruptable_process(length_command)
+            length_command = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json",
+                              str(video.file)]
+            probe = self.run_interruptable_process(length_command)
 
-            length_output = length.stdout.decode("utf-8")
-            length_error = length.stderr.decode("utf-8")
-            if length_error:
-                return self.dataset.finish_with_error("Cannot determine length of video {video.name}. Cannot stack "
-                                                      "videos without knowing the video lengths.")
-            else:
-                lengths[video.file.name] = float(length_output)
+            probe_error = probe.stderr.decode("utf-8", errors="replace")
+            if not probe_error:
+                try:
+                    # ffprobe leaves out the duration when it is unknown
+                    lengths[video.file.name] = float(json.loads(probe.stdout)["format"]["duration"])
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    probe_error = f"no duration found ({e})"
+
+            if probe_error:
+                self.dataset.log(f"ffprobe could not read {video.file.name}: {probe_error}")
+                return self.dataset.finish_with_error(f"Cannot determine length of video {video.file.name}. Cannot "
+                                                      "stack videos without knowing the video lengths.")
 
             videos.append(video.file)
 
@@ -214,9 +202,8 @@ class VideoStack(BasicProcessor):
         # loop again, this time to construct the ffmpeg command
         last_index = num_videos - 1
         for video in videos:
-            video_path = oslex.quote(str(video))
             # video to stack
-            command += ["-i", video_path]
+            command += ["-i", str(video)]
             if index > 0:
                 # 'bottom' video doesn't need transparency since there's nothing below it
                 transparency_filter.append(
@@ -285,6 +272,6 @@ class VideoStack(BasicProcessor):
                 f"Could not stack videos (error {result.returncode}); check the dataset log for details.")
 
         if with_errors:
-            self.dataset.update_status("Stack created, but with errors. Check dataset log for details.", is_final=True)
-
-        self.dataset.finish(1)
+            self.dataset.finish_with_warning(1, "Stack created, but with errors. Check dataset log for details.")
+        else:
+            self.dataset.finish(1)

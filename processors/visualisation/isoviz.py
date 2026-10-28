@@ -6,6 +6,7 @@ import re
 
 from backend.lib.processor import BasicProcessor
 from common.lib.helpers import UserInput, convert_to_int, pad_interval, get_4cat_canvas
+from common.lib.compatibility import Compatibility
 
 from calendar import month_abbr
 from math import sin, cos, tan, degrees, radians, copysign
@@ -31,9 +32,12 @@ class IsometricMultigraphRenderer(BasicProcessor):
 	"""
 	type = "render-graphs-isometric"  # job type ID
 	category = "Visual"  # category
-	title = "Side-by-side graphs"  # title displayed in UI
+	title = "Side-by-side area graphs"  # title displayed in UI
 	description = "Generate area graphs showing prevalence per item over time. These are visualised side-by-side on an isometric plane for easy comparison."  # description displayed in UI
 	extension = "svg"  # extension of result file, used internally and in UI
+
+	# rankable datasets with a single value per item (multiple_items=False)
+	compatibility = Compatibility(rankable=True, rankable_multiple_items=False)
 
 	# a palette generated with https://medialab.github.io/iwanthue/
 	colours = ["#eb010a", "#495dff", "#f35f00", "#5137e0", "#ffeb45", "#d05edf",
@@ -85,18 +89,6 @@ class IsometricMultigraphRenderer(BasicProcessor):
 			}
 		}
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow processor on rankable items
-
-		:param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		if module.is_dataset():
-			return module.is_rankable(multiple_items=False)
-		return False
-		
 	def process(self):
 		graphs = {}
 		intervals = []
@@ -143,8 +135,7 @@ class IsometricMultigraphRenderer(BasicProcessor):
 		# first make sure we actually have something to render
 		intervals = sorted(intervals)
 		if len(intervals) <= 1:
-			self.dataset.update_status("Not enough data for a side-by-side over-time visualisation.")
-			self.dataset.finish(0)
+			self.dataset.finish_as_empty("Not enough data for a side-by-side over-time visualisation.")
 			return
 
 		# only retain most-occurring series - sort by sum of all frequencies
@@ -188,8 +179,7 @@ class IsometricMultigraphRenderer(BasicProcessor):
 
 		if not graphs:
 			# maybe nothing is actually there to be graphed
-			self.dataset.update_status("No items match the selection criteria - nothing to visualise.")
-			self.dataset.finish(0)
+			self.dataset.finish_as_empty("No items match the selection criteria - nothing to visualise.")
 			return None
 
 		# how many vertical grid lines (and labels) are to be included at most

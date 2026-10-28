@@ -11,6 +11,7 @@ from backend.lib.processor import BasicProcessor
 from processors.visualisation.download_images import ImageDownloader
 from common.lib.dmi_service_manager import DmiServiceManager, DmiServiceManagerException, DsmOutOfMemory
 from common.lib.user_input import UserInput
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -25,10 +26,12 @@ class StableDiffusionImageGenerator(BasicProcessor):
     type = "image-downloader-stable-diffusion"  # job type ID
     category = "Visual"  # category
     title = "Generate images from text prompts"  # title displayed in UI
-    description = "Given a list of prompts, generates images for those prompts using the Stable Diffusion XL image model."  # description displayed in UI
+    description = "Given a list of prompts, generates images using the Stable Diffusion XL image model."  # description displayed in UI
     extension = "zip"  # extension of result file, used internally and in UI
 
-    followups = ImageDownloader.followups
+    # coarse map spec; is_compatible_with (below) is the runtime truth -- it also requires the
+    # dataset to have columns (a prompt source), which can't be declared statically
+    compatibility = Compatibility(required_settings={"dmi-service-manager.sd_enabled", "dmi-service-manager.ab_server_address"}, preferred_followups=ImageDownloader.followups)
 
     references = [
         "[Stable Diffusion XL 1.0 model card](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)"
@@ -54,6 +57,19 @@ class StableDiffusionImageGenerator(BasicProcessor):
             "tooltip": "Use '0' to allow unlimited number"
         },
     }
+
+    @classmethod
+    def get_queue_id(cls, remote_id, details, dataset) -> str:
+        """
+        Shared queue for locally hosted models
+
+        :param str remote_id:  Job item ID
+        :param dict details:  Job details
+        :param DataSet dataset:  Dataset to run job for
+        :return:
+        """
+        # Unique queue for locally hosted models; used by other local model processors as well
+        return "local_models" 
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):

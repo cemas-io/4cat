@@ -9,10 +9,11 @@ import json
 import os
 
 from common.lib.dmi_service_manager import DmiServiceManager, DsmOutOfMemory, DmiServiceManagerException, DsmConnectionError
-from common.lib.helpers import UserInput
+from common.lib.helpers import UserInput, hash_to_md5
 from backend.lib.processor import BasicProcessor
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.item_mapping import MappedItem
+from common.lib.compatibility import Compatibility
 
 __author__ = "Dale Wahl"
 __credits__ = ["Dale Wahl"]
@@ -37,8 +38,8 @@ class ImageTextDetector(BasicProcessor):
     """
     extension = "ndjson"  # extension of result file, used internally and in UI
 
-    # Processors designed to handle input from this Dataset
-    followups = ["image-text-wall"]
+    # image datasets (image archives or image-downloader output), when the OCR server is enabled
+    compatibility = Compatibility(media_types={"image"}, type_prefixes={"image-downloader"}, required_settings={"dmi-service-manager.eb_ocr_enabled", "dmi-service-manager.ab_server_address"}, preferred_followups=["image-text-wall"])
 
     references = [
         "[DMI OCR Server](https://github.com/digitalmethodsinitiative/ocr_server#readme)",
@@ -59,6 +60,19 @@ class ImageTextDetector(BasicProcessor):
             "help": "Enable OCR processor",
         },
     }
+
+    @classmethod
+    def get_queue_id(cls, remote_id, details, dataset) -> str:
+        """
+        Shared queue for locally hosted models
+
+        :param str remote_id:  Job item ID
+        :param dict details:  Job details
+        :param DataSet dataset:  Dataset to run job for
+        :return:
+        """
+        # Unique queue for locally hosted models; used by other local model processors as well
+        return "local_models" 
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -89,17 +103,6 @@ class ImageTextDetector(BasicProcessor):
             # },
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on image sets
-
-        :param module: Module to determine compatibility with
-        """
-        return config.get('dmi-service-manager.eb_ocr_enabled', False) and \
-               config.get("dmi-service-manager.ab_server_address", False) and \
-               (module.get_media_type() == "image" or module.type.startswith("image-downloader"))
-
     def process(self):
         """
         This takes a 4CAT zip file of images, and outputs a NDJSON file with the
@@ -108,7 +111,7 @@ class ImageTextDetector(BasicProcessor):
         """
         model_type = self.parameters.get("model_type", "paddle_ocr")
         if self.source_dataset.num_rows == 0:
-            self.dataset.finish_with_error("No images available.")
+            self.dataset.finish_as_empty("No images available.")
             return
 
         # Unpack the images into a staging_area
@@ -265,12 +268,15 @@ class ImageTextDetector(BasicProcessor):
 
                     processed += 1
 
-        detected_message = f"Detected text in {processed} of {total_image_files} images.{(' Skipped ' + str(skipped_images) + ' images; see log for details.') if skipped_images else ''}"
+        warning = '' if not skipped_images else f' Skipped {skipped_images} images; see log for details.'
+        detected_message = f"Detected text in {processed} of {total_image_files} images."
         if self.parameters.get("save_annotations", False) and not save_annotations:
-            self.dataset.update_status(f"{detected_message} No metadata file found, unable to update original dataset.", is_final=True)
+            warning = " No metadata file found, unable to update original dataset." + warning
+        if warning:
+            self.dataset.finish_with_warning(processed, detected_message + warning)
         else:
             self.dataset.update_status(detected_message)
-        self.dataset.finish(processed)
+            self.dataset.finish(processed)
 
     @staticmethod
     def map_item(item):
@@ -278,6 +284,7 @@ class ImageTextDetector(BasicProcessor):
         For preview frontend
         """
         return MappedItem({
+            "id": hash_to_md5(item.get("filename")),
             "image_filename": item.get("filename"),
             "model_type": item.get("model_type"),
             "text": item.get("simplified_text", {}).get("raw_text"),

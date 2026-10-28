@@ -9,8 +9,9 @@ import re
 from datetime import datetime
 
 from backend.lib.search import Search
+from common.lib.exceptions import MapItemException
 from common.lib.item_mapping import MappedItem, MissingMappedField
-from common.lib.helpers import normalize_url_encoding
+from common.lib.helpers import readable_url
 
 
 class SearchRedNote(Search):
@@ -51,6 +52,14 @@ class SearchRedNote(Search):
         :param post:
         :return:
         """
+        # Reject "tile stub" items — minimal thumbnail entries captured from
+        # surfaces like the user hover_card API. They carry no post content
+        # (no user, no body, no engagement, no timestamp) and aren't usable
+        # as research rows.
+        if "note_card" not in post and "user" not in post and post.get("_zs-origin") != "html" and "note" not in post:
+            source = post.get("__import_meta", {}).get("source_url", "")
+            raise MapItemException(f"Xiaohongshu tile stub without post content (source: {source or 'unknown'})")
+
         if post.get("_zs-origin") == "html":
             return SearchRedNote.map_item_from_html(post)
         else:
@@ -98,13 +107,15 @@ class SearchRedNote(Search):
         # permalinks need this token to work, else you get a 404 not found
         xsec_bit = f"?xsec_token={post['xsec_token']}" if post.get("xsec_token") else ""
         if item.get("video", {}).get("media"):
-            video_url = item["video"]["media"]["stream"]["h264"][0]["master_url"]
+            video_url = SearchRedNote.get_video_url(item["video"]["media"].get("stream") or {})
         else:
             video_url = MissingMappedField("")
 
+        author = item["user"]["nickname"] if "nickname" in item["user"] else item["user"]["nick_name"]
+
         timestamp = item.get("time", None)
         return MappedItem({
-            "collected_from_url": normalize_url_encoding(post.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
+            "collected_from_url": readable_url(post.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
             "id": item_id,
             "thread_id": item_id,
             "url": f"https://www.xiaohongshu.com/explore/{post['id']}{xsec_bit}",
@@ -112,7 +123,7 @@ class SearchRedNote(Search):
             "body": item.get("desc", "") if "desc" in item else MissingMappedField(""),
             "hashtags": ",".join(re.findall(r"#([^\s!@#$%^&*()_+{}:\"|<>?\[\];'\,./`~]+)", item["desc"])) if "desc" in item else MissingMappedField(""),
             "timestamp": datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp else MissingMappedField(""),
-            "author": item["user"]["nickname"],
+            "author": author,
             "author_avatar_url": item["user"]["avatar"],
             "image_urls": ",".join(images) if type(images) is list else images,
             "video_url": video_url,
@@ -124,6 +135,29 @@ class SearchRedNote(Search):
             # "shares": item["interact_info"]["share_count"],
             "unix_timestamp": int(timestamp / 1000) if timestamp else MissingMappedField(""),
         })
+
+    @staticmethod
+    def get_video_url(streams):
+        """
+        Get the URL of a post's video
+
+        RedNote offers each video in several versions, grouped by video
+        format. Older data names these groups after the format ("h264",
+        "h265"); newer data uses codes instead ("EF4", "EF5"). H.264 plays in
+        the most browsers and video players, so use it when it is there, and
+        otherwise the first version of any format that has a URL.
+
+        :param dict streams:  The post's `video.media.stream` object
+        :return str|MissingMappedField:
+        """
+        h264 = ("h264", "EF4")
+        formats = [*h264, *[name for name in streams if name not in h264]]
+        for name in formats:
+            for stream in streams.get(name) or []:
+                if stream.get("master_url"):
+                    return stream["master_url"]
+
+        return MissingMappedField("")
 
     @staticmethod
     def map_item_from_json_embedded(item):
@@ -152,8 +186,10 @@ class SearchRedNote(Search):
         else:
             likes = MissingMappedField("")
 
+        author = note["user"]["nickname"] if "nickname" in note["user"] else note["user"]["nick_name"]
+
         return MappedItem({
-            "collected_from_url": normalize_url_encoding(item.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
+            "collected_from_url": readable_url(item.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
             "id": item["id"],
             "thread_id": item["id"],
             "url": f"https://www.xiaohongshu.com/explore/{item['id']}{xsec_bit}",
@@ -161,7 +197,7 @@ class SearchRedNote(Search):
             "body": note.get("desc", "") if "desc" in note else MissingMappedField(""),
             "hashtags": ",".join(re.findall(r"#([^\s!@#$%^&*()_+{}:\"|<>?\[\];'\,./`~]+)", note["desc"])) if "desc" in note else MissingMappedField(""),
             "timestamp": datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp else MissingMappedField(""),
-            "author": note["user"]["nickname"],
+            "author": author,
             "author_avatar_url": note["user"]["avatar"],
             "image_url": image,
             "video_url": MissingMappedField(""),
@@ -185,7 +221,7 @@ class SearchRedNote(Search):
         :return MappedItem:
         """
         return MappedItem({
-            "collected_from_url": normalize_url_encoding(item.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
+            "collected_from_url": readable_url(item.get("__import_meta", {}).get("source_platform_url", "")),  # Zeeschuimer metadata
             "id": item["id"],
             "thread_id": item["id"],
             "url": f"https://www.xiaohongshu.com{item['url']}",

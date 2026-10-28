@@ -7,9 +7,11 @@
 
 <!-- standard CSS for item annotations -->
 <link rel="stylesheet" type="text/css" href="{{url_for('static', filename='css/explorer-annotation-generic.css')}}">
+<!-- standard CSS for the note on posts whose media was not downloaded -->
+<link rel="stylesheet" type="text/css" href="{{url_for('static', filename='css/explorer-media-placeholder.css')}}">
 
 <!-- Custom JavaScript for Explorer-specific functions -->
-<script type="text/javascript" src="{{url_for('static', filename='js/explorer.js')}}"></script>
+<script type="module" src="{{url_for('static', filename='js/explorer.js')}}"></script>
 
 <!-- Load some variables for which we need Jinja2 -->
 <script type="text/javascript">
@@ -19,7 +21,7 @@ let annotation_fields = {{ annotation_fields | tojson | safe }}
 
 // We're getting the dataset column names to make sure that
 // new annotation fields cannot overwrite these.
-let original_columns = {{ dataset.get_columns() | safe }}
+let original_columns = {{ dataset.get_columns() | tojson }}
 for (const a in annotation_fields) {
 	let annotation_label = annotation_fields[a]["label"]
 	if (original_columns.includes(annotation_label)) {
@@ -32,8 +34,12 @@ for (const a in annotation_fields) {
 
 <span id="current-username" style="display: none">{{ current_user.get_name() }}</span>
 
-<!-- Don't show certain data if the dataset is pseudonymised -->
-{% set pseudonymised = True if dataset.parameters and dataset.parameters.get('pseudonymise', False) %}
+<!-- Don't show certain data if the dataset is pseudonymised.
+     Author details can be hidden when a dataset is made, or afterwards with the
+     'Pseudonymise or anonymise' processor - the only option for a dataset that
+     was imported rather than collected. -->
+{% set author_info = (dataset.parameters or {}).get('author_info_replaced') or {} %}
+{% set pseudonymised = True if (dataset.parameters or {}).get('pseudonymise') or author_info.get('replaced') else False %}
 
 {% set key = dataset.data.key %}
 
@@ -60,7 +66,9 @@ for (const a in annotation_fields) {
 		<ol class="items" id="explorer-items">
 		{% for item in items %}
 			{% set item_index = loop.index - 1 %}
-			{% include "explorer/item.html" %}
+            {% if not (datasource == "media-import" and item.id == ".metadata.json") %}
+			    {% include "explorer/item.html" %}
+            {% endif %}
 		{% endfor %}
 		</ol>
 	</div>

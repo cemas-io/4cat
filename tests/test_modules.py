@@ -1,3 +1,6 @@
+import traceback
+from traceback import FrameSummary
+
 import pytest
 import time
 import json
@@ -12,6 +15,7 @@ we import within the test functions and utilize pytest.fixtures to mock the nece
 """
 
 PATH_ROOT = Path(os.path.abspath(os.path.dirname(__file__))).joinpath("..").resolve()
+DATASOURCES = PATH_ROOT.joinpath("datasources")
 
 @pytest.fixture
 def mock_database():
@@ -218,7 +222,8 @@ def test_processors(logger, fourcat_modules, mock_job, mock_job_queue, mock_data
                 processor_class.get_options(parent_dataset=mock_dataset, config=mock_basic_config)
             except Exception as e:
                 # Log the failure and add it to the failures list
-                logger.error(f"Processor {processor_name} failed in get_options: {e}")
+                trace = get_trace(traceback.TracebackException.from_exception(e).stack)
+                logger.error(f"Processor {processor_name} failed in get_options: {e} (in {trace.filename.split('/')[-1]}:{trace.lineno})")
                 failures.append((processor_name, str(e)))
 
             # Check if processor Class has "options" attribute
@@ -230,11 +235,13 @@ def test_processors(logger, fourcat_modules, mock_job, mock_job_queue, mock_data
             try:
                 processor_class(logger, job=mock_job, queue=mock_job_queue, manager=None, modules=fourcat_modules)
             except Exception as e:
-                logger.error(f"Processor {processor_name} failed in process(): {e}")
+                trace = get_trace(traceback.TracebackException.from_exception(e).stack)
+                logger.error(f"Processor {processor_name} failed in process(): {e} (in {trace.filename.split('/')[-1]}:{trace.lineno})")
                 failures.append((processor_name, str(e)))
 
         except Exception as e:
-            logger.error(f"Processor {processor_name} failed while setting up: {e}")
+            trace = get_trace(traceback.TracebackException.from_exception(e).stack)
+            logger.error(f"Processor {processor_name} failed while setting up: {e} (in {trace.filename.split('/')[-1]}:{trace.lineno})")
             failures.append((processor_name, str(e)))
 
 
@@ -245,6 +252,121 @@ def test_processors(logger, fourcat_modules, mock_job, mock_job_queue, mock_data
         pytest.fail(f"The following processors failed: {names}\n{failure_messages}")
     else:
         logger.info("All processors passed successfully.")
+
+@pytest.mark.dependency(depends=["test_module_collector"])
+def test_compatibility_coverage(logger, fourcat_modules):
+    """
+    Every concrete, non-collector processor should express its input contract.
+    Three states, differentiated:
+
+    * declares a `compatibility` (a Compatibility instance) -- fully covered;
+    * keeps an `is_compatible_with` override but NO coarse Compatibility --
+      "covered" for runtime, but *opaque to the processor map*: it can't place the
+      processor without at least a coarse spec. Surfaced as a warning, not a
+      failure;
+    * neither -- a hard failure: it silently rides the BasicProcessor default,
+      which is almost never intended.
+
+    Collectors (datasources) consume uploads/queries, not an existing dataset, so
+    they have no consumer-side compatibility and are exempt. Abstract bases that
+    genuinely run on nothing use the `Compatibility(types=set())` convention,
+    which counts as declared.
+    """
+    from backend.lib.processor import BasicProcessor
+    from backend.lib.search import Search
+    from common.lib.compatibility import Compatibility
+
+    base_method = BasicProcessor.is_compatible_with.__func__
+    stragglers = []       # neither a Compatibility nor an override -- hard failure
+    override_only = []    # an override but no coarse Compatibility -- opaque to the map
+
+    for name, processor_class in fourcat_modules.processors.items():
+        # collectors run on no dataset (a Search subclass, or a -search/-import type)
+        if issubclass(processor_class, Search) or name.endswith(("-search", "-import")):
+            continue
+
+        if isinstance(getattr(processor_class, "compatibility", None), Compatibility):
+            continue  # fully covered
+
+        # detect an override however it is declared: a classmethod or bound
+        # method exposes the underlying function as __func__, while a staticmethod
+        # or plain method already IS that function, so fall back to the attribute
+        # itself. (Without this fallback a @staticmethod override reads as no
+        # override and is misreported as a hard-failing straggler.)
+        attr = processor_class.is_compatible_with
+        own_method = getattr(attr, "__func__", attr)
+        if own_method is not base_method:
+            override_only.append(name)
+        else:
+            stragglers.append(name)
+
+    # surfaced, not failed: an override with no coarse Compatibility is opaque to
+    # the map -- it has no spec to read, so it can't place the processor at all
+    if override_only:
+        logger.warning(
+            f"{len(override_only)} processor(s) keep an is_compatible_with override but declare no "
+            f"coarse Compatibility (opaque to the map; a coarse spec would help): {sorted(override_only)}"
+        )
+
+    if stragglers:
+        logger.error(f"{len(stragglers)} processor(s) have neither a Compatibility nor an override: {sorted(stragglers)}")
+        pytest.fail(
+            "These processors declare no Compatibility and keep no is_compatible_with override "
+            f"(they silently ride the BasicProcessor default): {sorted(stragglers)}"
+        )
+
+    logger.info(
+        f"Compatibility coverage OK ({len(fourcat_modules.processors)} processors; "
+        f"{len(override_only)} override-only, 0 stragglers)."
+    )
+
+
+@pytest.mark.dependency(depends=["test_module_collector"])
+def test_required_settings_keys_declared(logger, fourcat_modules):
+    """
+    Every `required_settings` key in a Compatibility spec must be a real,
+    declarable config setting. A typo'd key fails *safe but silent*:
+    config.get("typo") returns None, the requirement is unmet, and the processor
+    quietly disappears from the UI with no error. test_compatibility_coverage
+    checks that a spec exists; this checks that its setting keys are valid.
+
+    The valid-key universe is built statically from what is actually loaded --
+    core config_definition plus the settings modules actually get to register.
+    So it needs no populated database, and uninstalled extensions (never loaded
+    here) are naturally out of scope rather than false failures.
+
+    Note this asks the collector rather than reading each worker's `config` dict
+    directly. A declaration the collector refuses -- one that collides with a
+    core setting, or uses a name reserved for core -- stays in the worker's own
+    dict but never becomes a setting. Counting those as declarable would let a
+    module require a setting it can never have, which is the same safe-but-silent
+    failure this test exists to catch.
+    """
+    from common.lib.compatibility import Compatibility
+    from common.lib.config_definition import config_definition
+
+    # core settings + the settings modules successfully declared
+    declarable = set(config_definition) | set(fourcat_modules.collect_module_config())
+
+    unknown = []
+    for name, processor_class in fourcat_modules.processors.items():
+        compatibility = getattr(processor_class, "compatibility", None)
+        if not isinstance(compatibility, Compatibility):
+            continue
+        for requirement in compatibility.required_settings:
+            # a requirement is either a bare key or a (key, expected) pair
+            key = requirement if isinstance(requirement, str) else requirement[0]
+            if key not in declarable:
+                unknown.append((name, key))
+
+    if unknown:
+        logger.error(f"{len(unknown)} required_settings key(s) are not declared anywhere: {sorted(unknown)}")
+    assert not unknown, (
+        "These required_settings keys are declared by no loaded module, so the setting is always "
+        "None and the processor is silently never compatible (likely a typo or a missing config "
+        f"declaration): {sorted(unknown)}"
+    )
+
 
 @pytest.mark.dependency(depends=["test_module_collector"])
 def test_datasources(logger, fourcat_modules, mock_job, mock_job_queue, mock_dataset, mock_database):
@@ -285,3 +407,110 @@ def test_datasources(logger, fourcat_modules, mock_job, mock_job_queue, mock_dat
         pytest.fail(f"The following datasources failed: {names}\n{failure_messages}")
     else:
         logger.info("All datasources passed successfully.")
+
+
+def test_dataset_finish_raises_on_double_finish(mock_dataset):
+    """
+    Regression guard for common/lib/dataset.py:986.
+
+    A second finish() call on an already-finished dataset would silently
+    overwrite status_type (e.g. downgrade WARNING → SUCCESS), since finish()
+    writes status_type directly via db.update and is not protected by the
+    no_status_updates flag that guards update_status. The raise turns that
+    silent corruption into a loud failure. If this test starts failing
+    because finish() was made idempotent, that change re-introduces the
+    bug class fixed in processors/metrics/url_titles.py.
+    """
+    from common.lib.dataset import StatusType
+
+    mock_dataset.data["is_finished"] = True
+    mock_dataset.data["status_type"] = StatusType.WARNING.value
+
+    with pytest.raises(RuntimeError, match="finished"):
+        mock_dataset.finish(5)
+
+def test_every_core_data_source_folder_registers():
+    """
+    A folder under datasources/ that holds Python code must register as a data
+    source. 4CAT's own data sources always win a DATASOURCE clash, so a core
+    folder left half-removed is worse than no folder at all: it keeps the id an
+    extension is trying to take over, and the extension is refused in favour of
+    something that no longer works. Retiring a data source to an extension means
+    removing 4CAT's copy, not emptying it.
+
+    A folder with no Python code in it is not checked. Deleting the files leaves
+    the directory behind on an existing checkout (git does not track directories,
+    and __pycache__ is ignored), and that leftover is litter rather than a
+    half-removed data source - the collector never looks at it.
+    """
+    offenders = {}
+    for folder in sorted(DATASOURCES.glob("*/")):
+        if not folder.is_dir() or not any(folder.rglob("*.py")):
+            continue
+
+        init = folder.joinpath("__init__.py")
+        source = init.read_text(encoding="utf-8") if init.exists() else ""
+        missing = [name for name in ("DATASOURCE", "init_datasource") if name not in source]
+        if missing:
+            offenders[folder.name] = missing
+
+    assert not offenders, (
+        f"these datasources/ folders contain Python code but do not register as a data source, so 4CAT "
+        f"holds their id without providing anything: {offenders}. Remove the folder, or give it an "
+        f"__init__.py defining both names."
+    )
+
+
+def test_a_second_collector_reports_no_data_source_clashes(fourcat_modules, mock_basic_config):
+    """
+    4CAT refuses a DATASOURCE id an earlier folder already provided, so an
+    extension cannot take over a built-in data source.
+
+    The registry that check reads is shared by every collector in the process,
+    and load_datasources() always rescans, so without comparing folders a second
+    collector reports every data source already loaded as a clash - telling the
+    operator to rename a built-in, naming the same folder on both sides. This
+    fixture is function-scoped and several tests ask for it, so more than one
+    collector per run is the normal case, not a corner one.
+    """
+    from common.lib.module_loader import ModuleCollector
+
+    second = ModuleCollector(config=mock_basic_config)
+
+    clashes = [line for line in second.log_buffer.split("\n") if "already provided by" in line]
+    assert not clashes, f"rescanning a folder that is already registered is not a clash: {clashes}"
+
+
+def test_two_folders_claiming_one_data_source_id_are_reported(mock_basic_config):
+    """
+    A real clash - two different folders declaring the same DATASOURCE - still
+    has to be reported, and whichever was registered first is kept.
+    """
+    from common.lib.module_loader import ModuleCollector
+
+    collector = object.__new__(ModuleCollector)
+    collector.log_buffer = ""
+    collector.config = mock_basic_config
+    # set on the instance, so the registry shared by the class is left alone
+    collector.datasources = {"bsky": {"path": Path("/somewhere/else"), "name": "Not really Bluesky"}}
+
+    collector.load_datasources()
+
+    assert "already provided by" in collector.log_buffer
+    assert collector.datasources["bsky"]["path"] == Path("/somewhere/else"),         "the folder registered first keeps the id"
+
+
+def get_trace(stack) -> FrameSummary:
+    """
+    Get relevant stack trace frame
+
+    Skips over frames that are from (frozen) internal libraries
+
+    :param stack:
+    :return FrameSummary:
+    """
+    bit = stack.pop()
+    while stack and not bit.filename.startswith(str(PATH_ROOT)):
+        bit = stack.pop()
+
+    return bit

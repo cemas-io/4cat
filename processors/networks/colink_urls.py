@@ -3,12 +3,14 @@ Generate co-link network of URLs in posts
 """
 import re
 import time
+import multiprocessing
 
 import psutil
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.exceptions import ProcessorInterruptedException
-from common.lib.helpers import UserInput
+from common.lib.helpers import UserInput, urls_in_text
 
 import networkx as nx
 
@@ -16,6 +18,10 @@ __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
 __maintainer__ = "Stijn Peeters"
 __email__ = "4cat@oilab.eu"
+
+
+def _write_gexf(graph, path):
+	nx.write_gexf(graph, path)
 
 class URLCoLinker(BasicProcessor):
 	"""
@@ -27,6 +33,9 @@ class URLCoLinker(BasicProcessor):
 	description = "Create a GEXF network file comprised of URLs appearing together (in a post or thread). " \
 				  "Edges are weighted by amount of co-links."  # description displayed in UI
 	extension = "gexf"  # extension of result file, used internally and in UI
+
+	# Allow on top-level CSV/NDJSON datasets
+	compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
 
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -62,16 +71,6 @@ class URLCoLinker(BasicProcessor):
 			}
 		}
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-        Allow processor on top datasets.
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-		return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
-
 	def process(self):
 		"""
 		This takes a 4CAT results file as input, and outputs a new CSV file
@@ -82,11 +81,9 @@ class URLCoLinker(BasicProcessor):
 		if self.parameters.get("level") == "thread" and "thread_id" not in self.source_dataset.get_columns():
 			self.dataset.finish_with_error("Thread-level co-linking requires a 'thread_id' column in the dataset.")
 			return
-		
-		# we use these to extract URLs and host names if needed
-		link_regex = re.compile(r"https?://[^\s\]()]+")
+
+		# we use this to get host names if needed
 		www_regex = re.compile(r"^www\.")
-		trailing_dot = re.compile(r"[.,)]$")
 
 		self.dataset.update_status("Reading source file")
 		update_on_item = max(10, int(self.source_dataset.num_rows / 100))
@@ -108,7 +105,7 @@ class URLCoLinker(BasicProcessor):
 			if not post["body"]:
 				continue
 
-			post_links = link_regex.findall(post["body"])
+			post_links = urls_in_text(post["body"])
 
 			# if the result has an explicit url per post, take that into
 			# account as well
@@ -122,10 +119,9 @@ class URLCoLinker(BasicProcessor):
 					# not a valid URL, e.g. "http://" without anything after the //
 					pass
 
-			# deduplicate, so repeated links within one posts don't inflate
-			post_links = [trailing_dot.sub("", link) for link in post_links]
 			# Encode the URLs, e.g. replace commas with '%2c', so it makes a nice gdf file
 			post_links = [link.replace(",", "%2c").replace("'", "").replace('"',"").replace("\\_","_") for link in post_links]
+			# deduplicate, so repeated links within one posts don't inflate
 			post_links = sorted(set(post_links))
 
 			# if we're looking at a post level, each post gets its own
@@ -172,11 +168,25 @@ class URLCoLinker(BasicProcessor):
 		self.dataset.update_status(f"Network has {len(network.nodes)} and {len(network.edges)} edges")
 		self.dataset.log(f"time elapsed: {time.time() - start_time:.2f} seconds")
 		self.dataset.update_status("Writing network file")
-		if psutil.virtual_memory().percent > 95:
-			self.dataset.update_status("WARNING: memory usage about 95%; network may fail...")
-			self.log.warning(f"Memory usage above 95%: network dataset {self.dataset.key}")
-			#TODO: add perhaps kill the processor? It's frustrating that we can collect the data but not write it!
-		nx.write_gexf(network, self.dataset.get_results_path())
+
+		writer = multiprocessing.Process(target=_write_gexf, args=(network, self.dataset.get_results_path()))
+		writer.start()
+		while writer.is_alive():
+			if psutil.virtual_memory().percent >= 90:
+				self.log.warning(f"Memory usage above 90% during write; terminating writer for dataset {self.dataset.key}")
+				self.dataset.update_status("WARNING: memory usage above 90%; terminating write to prevent crash")
+				writer.terminate()
+				writer.join(timeout=5)
+				self.dataset.finish_with_error("Network write terminated because memory usage exceeded 90%")
+				return
+			time.sleep(0.5)
+
+		writer.join()
+		if writer.exitcode != 0:
+			self.dataset.finish_with_error("Network write failed")
+			self.log.warning(f"Network writer exited with code {writer.exitcode} for dataset {self.dataset.key}")
+			return
+
 		self.dataset.log(f"time to complete: {time.time() - start_time:.2f} seconds")
 		self.dataset.finish(len(network.nodes))
 

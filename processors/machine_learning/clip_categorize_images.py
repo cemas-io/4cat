@@ -10,6 +10,7 @@ from common.lib.dmi_service_manager import DmiServiceManager, DmiServiceManagerE
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.user_input import UserInput
 from common.lib.item_mapping import MappedItem
+from common.lib.compatibility import Compatibility
 
 __author__ = "Dale Wahl"
 __credits__ = ["Dale Wahl"]
@@ -23,11 +24,13 @@ class CategorizeImagesCLIP(BasicProcessor):
     """
     type = "image-to-categories"  # job type ID
     category = "Visual"  # category
-    title = "Categorize Images using OpenAI's CLIP models"  # title displayed in UI
-    description = "Given a list of categories, the CLIP model will estimate likelihood an image is to belong to each (total of all categories per image will be 100%)."  # description displayed in UI
+    title = "Categorize images with CLIP"  # title displayed in UI
+    description = ("Provide a list of categories and classify images with OpenAI's CLIP models. This will estimate "
+                   "the likelihood an image belongs to a category (total of all category values will be 100%).")  # description displayed in UI
     extension = "ndjson"  # extension of result file, used internally and in UI
 
-    followups = ["image-category-wall"]
+    # image datasets (image archives or image-downloader output), when CLIP is enabled
+    compatibility = Compatibility(media_types={"image"}, type_prefixes={"image-downloader"}, required_settings={"dmi-service-manager.cc_clip_enabled", "dmi-service-manager.ab_server_address"}, preferred_followups=["image-category-wall"])
 
     references = [
         "[OpenAI CLIP blog](https://openai.com/research/clip)",
@@ -56,13 +59,17 @@ class CategorizeImagesCLIP(BasicProcessor):
     }
 
     @classmethod
-    def is_compatible_with(cls, module=None, config=None):
+    def get_queue_id(cls, remote_id, details, dataset) -> str:
         """
-        Allow on image archives if enabled in Control Panel
+        Shared queue for locally hosted models
+
+        :param str remote_id:  Job item ID
+        :param dict details:  Job details
+        :param DataSet dataset:  Dataset to run job for
+        :return:
         """
-        return config.get("dmi-service-manager.cc_clip_enabled", False) and \
-               config.get("dmi-service-manager.ab_server_address", False) and \
-               (module.get_media_type() == "image" or module.type.startswith("image-downloader"))
+        # Unique queue for locally hosted models; used by other local model processors as well
+        return "local_models" 
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):

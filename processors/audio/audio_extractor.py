@@ -5,9 +5,12 @@ This processor also requires ffmpeg to be installed in 4CAT's backend
 https://ffmpeg.org/
 """
 import shutil
+import zipfile
+from pathlib import Path
 import oslex
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility, is_executable
 from common.lib.exceptions import ProcessorInterruptedException
 
 __author__ = "Dale Wahl"
@@ -29,19 +32,10 @@ class AudioExtractor(BasicProcessor):
     title = "Extract audio from videos"  # title displayed in UI
     description = "Create audio files per video"  # description displayed in UI
     extension = "zip"  # extension of result file, used internally and in UI
+    media_type = "audio"
 
-    followups = ["audio-to-text"]
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow on videos only
-
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return (module.get_media_type() == "video" or module.type.startswith("video-downloader")) and \
-            config.get("video-downloader.ffmpeg_path") and \
-            shutil.which(config.get("video-downloader.ffmpeg_path"))
+    # Allow on video datasets when ffmpeg is available
+    compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, required_settings={("video-downloader.ffmpeg_path", is_executable)}, preferred_followups=["audio-to-text"])
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -64,8 +58,7 @@ class AudioExtractor(BasicProcessor):
         """
         # Check processor able to run
         if self.source_dataset.num_rows == 0:
-            self.dataset.update_status("No videos from which to extract audio.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No videos from which to extract audio.")
             return
 
         max_files = self.parameters.get("amount", 100)
@@ -73,17 +66,31 @@ class AudioExtractor(BasicProcessor):
         # Prepare staging areas for videos and video tracking
         output_dir = self.dataset.get_staging_area()
 
-        total_possible_videos = max(max_files if max_files != 0 else self.source_dataset.num_rows - 1, 1)  # for the metadata file that is included in archives
+        # Estimate how many actual video files we will attempt, excluding archive metadata.
+        total_possible_videos = self.source_dataset.num_rows
+        source_archive = self.source_dataset.get_results_path()
+        if source_archive.exists() and source_archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(source_archive, "r") as archive_file:
+                total_possible_videos = sum(
+                    1
+                    for archived_file in archive_file.infolist()
+                    if not archived_file.is_dir() and Path(archived_file.filename).name != ".metadata.json"
+                )
+
+        if max_files != 0:
+            total_possible_videos = min(total_possible_videos, max_files)
+
         processed_videos = 0
+        written = 0
 
         self.dataset.update_status("Extracting video audio")
-        for item in self.source_dataset.iterate_items():
+        for item in self.source_dataset.iterate_items(processor=self, get_annotations=False):
             if self.interrupted:
                 raise ProcessorInterruptedException("Interrupted while determining image wall order")
 
             # Check for 4CAT's metadata JSON and copy it
             if item.file.name == '.metadata.json':
-                shutil.copy(item.file, output_dir.joinpath(".video_metadata.json"))
+                shutil.copy(item.file, output_dir.joinpath(".metadata.json"))
                 continue
 
             if max_files != 0 and processed_videos >= max_files:
@@ -100,27 +107,34 @@ class AudioExtractor(BasicProcessor):
 
             result = self.run_interruptable_process(command, cleanup_paths=(output_dir,))
 
+            # Count attempted conversions separately from successful outputs.
+            processed_videos += 1
+
             # Capture logs
             ffmpeg_output = result.stdout.decode("utf-8")
             ffmpeg_error = result.stderr.decode("utf-8")
 
+            audio_file = output_dir.joinpath(f"{vid_name}.wav")
+            if audio_file.exists():
+                written += 1
+
             if ffmpeg_output:
-                with open(str(output_dir.joinpath(f"{vid_name}_stdout.log")), 'w') as outfile:
+                with open(str(output_dir.joinpath(f"{vid_name}_stdout.log")), 'w', encoding="utf-8") as outfile:
                     outfile.write(ffmpeg_output)
 
             if ffmpeg_error:
                 # TODO: Currently, appears all output is here; perhaps subprocess.PIPE?
-                with open(str(output_dir.joinpath(f"{vid_name}_stderr.log")), 'w') as outfile:
+                with open(str(output_dir.joinpath(f"{vid_name}_stderr.log")), 'w', encoding="utf-8") as outfile:
                     outfile.write(ffmpeg_error)
 
             if result.returncode != 0:
                 error = 'Error Return Code with video %s: %s' % (vid_name, str(result.returncode))
                 self.dataset.log(error)
 
-            processed_videos += 1
-            self.dataset.update_status(
-                "Extracted audio from %i of %i videos" % (processed_videos, total_possible_videos))
-            self.dataset.update_progress(processed_videos / total_possible_videos)
+            self.dataset.update_status(f"Extracted audio from {written} of {processed_videos} attempted videos")
+            self.dataset.update_progress(min(1, processed_videos / max(total_possible_videos, 1)))
 
         # Finish up
-        self.write_archive_and_finish(output_dir, num_items=processed_videos)
+        warning = f"Extracted {written}/{processed_videos} audio files, check the logs for errors." \
+            if written < processed_videos else None
+        self.write_archive_and_finish(output_dir, num_items=written, warning=warning)

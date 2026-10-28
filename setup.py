@@ -25,7 +25,8 @@ core_packages = {
 	"langchain_openai",
 	"langchain_mistralai",
 	"langchain_deepseek",
-	"markdown2==2.4.2",
+	"markdown2==2.5.5",
+	"natsort",
 	"oslex",
 	"packaging",
 	"psutil~=5.0",
@@ -40,7 +41,7 @@ core_packages = {
 	"requests_futures",
 	"ruff",
 	"svgwrite~=1.4.0",
-	"ural~=1.3",
+	"ural~=1.6.2",
 	"Werkzeug"
 }
 
@@ -57,16 +58,16 @@ processor_packages = {
 	"jieba",  # word-trees, tokenise
 	"jsonschema",  # llm_prompter
 	"lxml",  # download_images_4chan, wikipedia_network, url_titles
-	"nltk~=3.9.1",  # similar-words, word-trees, collocations, split_sentences, tokenise
+	"nltk~=3.9.3",  # similar-words, word-trees, collocations, split_sentences, tokenise
 	"networkx>=3.0",  # networks/*
 	"numpy",  # image_wall, histwords, video_hasher, hash_similarity_network, aggregate_stats, tf_idf
 	"pandas",  # youtube_imagewall, tf_idf
-	"pyahocorasick~=1.4.0",  # tokenise
+	"pyahocorasick~=2.3",  # tokenise
 	"PyTumblr==0.1.0",  # search_tumblr
 	"razdel~=0.5",  # tokenise
-	"scenedetect[opencv]",  # video_scene_identifier
+	"scenedetect[opencv]>=0.7",  # video_scene_identifier
 	"scikit-learn",  # image_wall, histwords, tf_idf, topic_modeling, classification_evaluation, confusion_matrix
-	"Telethon~=1.36.0",  # search_telegram, download-telegram-videos, download-telegram-images
+	"Telethon~=1.36.0",  # search_telegram, download_telegram_videos, download-telegram-images
 	"unidecode~=1.3",  # accent_fold
 	"wordcloud~=1.8",  # word-cloud
 	# The https://github.com/akamhy/videohash is not being maintained anymore; these are two patches

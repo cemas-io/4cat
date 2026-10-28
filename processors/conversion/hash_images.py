@@ -9,6 +9,7 @@ from PIL import UnidentifiedImageError
 from backend.lib.processor import BasicProcessor
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.helpers import UserInput, hash_image, stringify_hash
+from common.lib.compatibility import Compatibility
 from processors.metrics.group_hashes import HashGrouper
 
 
@@ -27,6 +28,9 @@ class ImageHasher(BasicProcessor):
     title = "Hash images"  # title displayed in UI
     description = "Convert images to text hashes for comparison and similarity detection."  # description displayed in UI
     extension = "csv"
+
+    # image datasets: image archives, image-downloader output, or extracted video frames
+    compatibility = Compatibility(media_types={"image"}, type_prefixes={"image-downloader"}, types={"video-frames"})
 
     references = [
         "[Imagehash library](https://github.com/JohannesBuchner/imagehash?tab=readme-ov-file)",
@@ -93,16 +97,6 @@ class ImageHasher(BasicProcessor):
                 "tooltip": "Maximum difference as a percentage of hash bits (0–100). Examples: ~4% ≈ 10/256 for size=16; ~4% ≈ 40/1024 for size=32. For crop-resistant, the % applies to each component hash."
             }
         }
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on image archives
-
-        :param module: Module to determine compatibility with
-        """
-        return module.get_media_type() == "image" or module.type.startswith(
-            "image-downloader") or module.type == "video-frames"
 
     def process(self):
         """
@@ -230,5 +224,12 @@ class ImageHasher(BasicProcessor):
         final_msg = f"Processed {processed:,} images"
         if group_by:
             final_msg += f", grouped into {next_group_id:,} groups (threshold={similarity_pct:.2f}%)"
-        self.dataset.update_status(final_msg, is_final=True)
-        self.dataset.finish(num_rows=processed)
+
+        warning = None
+        if skipped:
+            warning = final_msg + f". Skipped {skipped:,} images"
+        if warning:
+            self.dataset.finish_with_warning(processed, warning)
+        else:
+            self.dataset.update_status(final_msg, is_final=True)
+            self.dataset.finish(num_rows=processed)

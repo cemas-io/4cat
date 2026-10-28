@@ -6,7 +6,9 @@ from dateutil.parser import ParserError
 from datetime import datetime
 
 from processors.filtering.base_filter import BaseFilter
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
+from common.lib.exceptions import QueryParametersException
 
 __author__ = "Dale Wahl"
 __credits__ = ["Dale Wahl"]
@@ -21,7 +23,10 @@ class DateFilter(BaseFilter):
     type = "date-filter"  # job type ID
     category = "Filtering"  # category
     title = "Filter by date"  # title displayed in UI
-    description = "Retains posts between given dates. This will create a new dataset."
+    description = "Retains posts between given dates. This creates a new dataset."
+
+    # Allow on top-level CSV/NDJSON datasets
+    compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
     
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -55,16 +60,6 @@ class DateFilter(BaseFilter):
         
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on NDJSON and CSV files
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
-
     def filter_items(self):
         """
         Create a generator to iterate through items that can be passed to create either a csv or ndjson
@@ -78,8 +73,7 @@ class DateFilter(BaseFilter):
 
         # Should not be None
         if not min_date or not max_date:
-            self.dataset.update_status("No date range provided", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("No date range provided")
             return
 
         # Convert to datetime for easy comparison
@@ -149,3 +143,25 @@ class DateFilter(BaseFilter):
             self.dataset.update_status("No items matched your criteria (%i invalid dates)" % invalid_dates, is_final=True)
         elif invalid_dates > 0:
             self.dataset.update_status("Matched %i items (%i processed, %i invalid dates)" % (matching_items, processed_items, invalid_dates), is_final=True)
+
+
+    @staticmethod
+    def validate_query(query, request, config):
+        """
+        Validate input
+
+        Checks if everything needed is filled in.
+
+        :param query:
+        :param request:
+        :param config:
+        :return:
+        """
+
+        if not query["daterange"] or (not query["daterange"][0] or not query["daterange"][1]):
+            raise QueryParametersException("Please enter a valid date range.")
+
+        if "column" in query and not query["column"]:
+            raise QueryParametersException("Please enter a valid timestamp column.")
+
+        return query

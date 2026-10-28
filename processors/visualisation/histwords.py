@@ -12,6 +12,7 @@ from sklearn.decomposition import PCA, TruncatedSVD
 from gensim.models import KeyedVectors
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput, convert_to_int, get_4cat_canvas, convert_to_float
 from common.lib.exceptions import ProcessorInterruptedException
 
@@ -40,6 +41,9 @@ class HistWordsVectorSpaceVisualiser(BasicProcessor):
     title = "Chart diachronic nearest neighbours"  # title displayed in UI
     description = "Visualise nearest neighbours of a given query across all models and show the closest neighbours per model in one combined graph. Based on the 'HistWords' algorithm by Hamilton et al."  # description displayed in UI
     extension = "svg"  # extension of result file, used internally and in UI
+
+    # Allow processor on word embedding models
+    compatibility = Compatibility(types={"generate-embeddings"})
 
     references = [
         "HistWords: [Hamilton, W. L., Leskovec, J., & Jurafsky, D. (2016). Diachronic word embeddings reveal statistical laws of semantic change. *arXiv preprint** arXiv:1605.09096.](https://arxiv.org/pdf/1605.09096.pdf)",
@@ -104,22 +108,11 @@ class HistWordsVectorSpaceVisualiser(BasicProcessor):
             }
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on token sets
-
-        :param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.type == "generate-embeddings"
-
     def process(self):
         # parse parameters
         input_words = self.parameters.get("words", "")
         if not input_words or not input_words.split(","):
-            self.dataset.update_status("No input words provided, cannot look for similar words.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No input words provided, cannot look for similar words.")
             return
 
         input_words = input_words.split(",")
@@ -192,8 +185,7 @@ class HistWordsVectorSpaceVisualiser(BasicProcessor):
 
             for query in input_words:
                 if query not in model.key_to_index:
-                    self.dataset.update_status("Query '%s' was not found in model %s; cannot find nearest neighbours." % (query, model_name), is_final=True)
-                    self.dataset.finish(0)
+                    self.dataset.finish_as_empty(f"Query '{query}' was not found in model {model_name}; cannot find nearest neighbours.")
                     return
 
                 if self.interrupted:
@@ -260,8 +252,7 @@ class HistWordsVectorSpaceVisualiser(BasicProcessor):
             vectors = svd.fit_transform(vectors)
         else:
             shutil.rmtree(staging_area)
-            self.dataset.update_status("Invalid dimensionality reduction technique selected", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("Invalid dimensionality reduction technique selected")
             return
 
         # also keep track of the boundaries of our 2D space, so we can plot

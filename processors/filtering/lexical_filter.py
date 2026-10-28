@@ -4,6 +4,7 @@ Filter posts by lexicon
 import re
 
 from processors.filtering.base_filter import BaseFilter
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
 
 __author__ = "Stijn Peeters"
@@ -22,8 +23,10 @@ class LexicalFilter(BaseFilter):
     description = "Retains posts that contain selected words or phrases, including preset word lists. " \
                   "This creates a new dataset."  # description displayed in UI
 
+    # Allow on top-level CSV/NDJSON datasets
+    compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
+
     references = [
-        "[Hatebase](https://hatebase.org)",
         "[Regex101](https://regex101.com/)"
     ]
 
@@ -39,15 +42,6 @@ class LexicalFilter(BaseFilter):
         :return dict:   Options for this processor
         """
         return {
-            "lexicon": {
-                "type": UserInput.OPTION_MULTI,
-                "default": [],
-                "options": {
-                    "hatebase-en-unambiguous": "Hatebase.org hate speech list (English, unambiguous terms)",
-                    "hatebase-en-ambiguous": "Hatebase.org hate speech list (English, ambiguous terms)",
-                },
-                "help": "Filter items containing words in these lexicons. Note that they may be outdated."
-            },
             "lexicon-custom": {
                 "type": UserInput.OPTION_TEXT,
                 "default": "",
@@ -72,16 +66,6 @@ class LexicalFilter(BaseFilter):
             }
         }
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on NDJSON and CSV files
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
-
     def filter_items(self):
         """
         Create a generator to iterate through items that can be passed to create either a csv or ndjson. Use
@@ -93,26 +77,20 @@ class LexicalFilter(BaseFilter):
         exclude = self.parameters.get("exclude", False)
         case_sensitive = self.parameters.get("case-sensitive", False)
 
+        custom_lexicon = self.parameters.get("lexicon-custom", "")
+        if not custom_lexicon:
+            self.dataset.finish_with_error("No lexicon provided")
+            return
+
         # load lexicons from word lists
         lexicons = {}
-        for lexicon_id in self.parameters.get("lexicon", []):
-            lexicon_file = self.config.get('PATH_ROOT').joinpath(f"common/assets/wordlists/{lexicon_id}.txt")
-            if not lexicon_file.exists():
-                continue
-
-            if lexicon_id not in lexicons:
-                lexicons[lexicon_id] = set()
-
-            with open(lexicon_file, encoding="utf-8") as lexicon_handle:
-                lexicons[lexicon_id] |= set(lexicon_handle.read().splitlines())
-
         # add user-defined words
         custom_id = "user-defined"
         if custom_id not in lexicons:
             lexicons[custom_id] = set()
 
         custom_lexicon = set(
-            [word.strip() for word in self.parameters.get("lexicon-custom", "").split(",") if word.strip()])
+            [word.strip() for word in custom_lexicon.split(",") if word.strip()])
         lexicons[custom_id] |= custom_lexicon
 
         # compile into regex for quick matching
@@ -135,8 +113,7 @@ class LexicalFilter(BaseFilter):
                     lexicon_regexes[lexicon_id] = re.compile(
                         r"\b(" + "|".join(phrases) + r")\b")
             except re.error:
-                self.dataset.update_status("Invalid regular expression, cannot use as filter", is_final=True)
-                self.dataset.finish(0)
+                self.dataset.finish_with_error("Invalid regular expression, cannot use as filter")
                 return
 
         # now for the real deal

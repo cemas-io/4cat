@@ -6,6 +6,7 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 
 from common.lib.helpers import UserInput
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -19,11 +20,12 @@ class SplitSentences(BasicProcessor):
     """
     type = "sentence-split"  # job type ID
     category = "Text analysis"  # category
-    title = "Sentence split"  # title displayed in UI
-    description = "Split a body of posts into discrete sentences. Output file has one row per sentence, containing the sentence and post ID."  # description displayed in UI
+    title = "Split text into sentences"  # title displayed in UI
+    description = "Split a body of posts into discrete sentences. Output file has one row per sentence, containing the sentence and item ID."  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
-    followups = []
+    # Allow on CSV/NDJSON datasets
+    compatibility = Compatibility(extensions={"csv", "ndjson"})
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -84,17 +86,6 @@ class SplitSentences(BasicProcessor):
             options["column"]["options"] = {v: v for v in columns}
 
         return options
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor to run on all csv and NDJSON datasets
-
-        :param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-
-        return module.get_extension() in ("csv", "ndjson")
 
     def process(self):
         """

@@ -16,6 +16,21 @@ component = Blueprint("explorer", __name__)
 api_ratelimit = current_app.limiter.shared_limit("45 per minute", scope="api")
 
 
+def user_can_annotate(dataset):
+    """
+    Check whether the current user may change annotations on a dataset
+
+    Annotating adds to a dataset, like running a processor does, so only the
+    dataset's owners and users who may manipulate all datasets can do it.
+    Being able to view a dataset in the Explorer is not enough.
+
+    :param DataSet dataset:  Dataset to check
+    :return bool:
+    """
+    return bool(g.config.get("privileges.admin.can_manipulate_all_datasets")
+                or dataset.is_accessible_by(current_user, "owner"))
+
+
 @component.route("/results/<string:dataset_key>/explorer/", defaults={"page": 1})
 @component.route("/results/<string:dataset_key>/explorer/page/<int:page>")
 @api_ratelimit
@@ -139,6 +154,9 @@ def explorer_dataset(dataset_key: str, page=1):
     if not items:
         return error(404, error="No items or items could not be displayed")
 
+    # If there are media items downloaded for these posts, we're going to retrieve them
+    media_files = dataset.get_media_from_children(item_ids=item_ids)
+
     # Check whether there's already annotations made for these items.
     # We're not using `get_annotations()` because we don't need *all* annotations.
     # If there's annotations made, pass these to the template and set the item ID
@@ -157,10 +175,12 @@ def explorer_dataset(dataset_key: str, page=1):
         dataset=dataset,
         datasource=datasource,
         items=items,
+        media_files=media_files,
         annotation_fields=annotation_fields,
         annotations=item_annotations,
         processors=current_app.fourcat_modules.processors,
         from_datasets=from_datasets,
+        can_annotate=g.config.get("privileges.can_run_processors") and user_can_annotate(dataset),
         page=page,
         offset=offset,
         items_per_page=items_per_page,
@@ -170,7 +190,7 @@ def explorer_dataset(dataset_key: str, page=1):
     )
 
 
-@component.route("/explorer/save_annotation_fields/<string:dataset_key>/", methods=["POST"])
+@component.route("/explorer/save_annotation_fields/<string:dataset_key>", methods=["POST"])
 @api_ratelimit
 @login_required
 @setting_required("privileges.can_run_processors")
@@ -194,12 +214,18 @@ def explorer_save_annotation_fields(dataset_key: str):
     except DataSetException:
         return error(404, error="Dataset not found.")
 
+    if not user_can_annotate(dataset):
+        return error(403, error="You cannot change annotations on this dataset.")
+
     # Save it!
     annotation_fields = request.get_json()
 
-    # Potentially re-add annotation fields that were hidden in the Explorer
+    # Re-add annotation fields that were hidden in the Explorer.
+    # These (e.g. processor-generated fields) are filtered out before being sent
+    # to the editor, so the client never posts them back. If we don't restore them
+    # here they'd be treated as deleted and their annotations would be wiped.
     if dataset.annotation_fields:
-        for annotation_field_id, annotation_field in annotation_fields.items():
+        for annotation_field_id, annotation_field in dataset.annotation_fields.items():
             if annotation_field.get("hide_in_explorer"):
                 annotation_fields[annotation_field_id] = annotation_field
 
@@ -235,6 +261,9 @@ def explorer_save_annotation_label(dataset_key: str):
         dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
     except DataSetException:
         return error(404, error="Dataset not found.")
+
+    if not user_can_annotate(dataset):
+        return error(403, error="You cannot change annotations on this dataset.")
 
     payload = request.get_json(silent=True)
     if type(payload) is not dict:
@@ -279,6 +308,9 @@ def explorer_save_annotations(dataset_key: str):
         dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
     except DataSetException:
         return error(404, error="Dataset not found.")
+
+    if not user_can_annotate(dataset):
+        return error(403, error="You cannot change annotations on this dataset.")
 
     try:
         annotations_saved = dataset.save_annotations(annotations)

@@ -8,6 +8,7 @@ from ural import is_url
 from processors.conversion.extract_urls import ExtractURLs
 from common.lib.exceptions import ProcessorInterruptedException
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput, split_urls
 
 __author__ = "Dale Wahl"
@@ -25,8 +26,11 @@ class ConsolidateURLs(BasicProcessor):
     type = "consolidate-urls"  # job type ID
     category = "Conversion"  # category
     title = "Consolidate URLs"  # title displayed in UI
-    description = "Retain only domain (and optionally path) of URLs; used for Custom Networks (e.g. author + domains)"
+    description = "Retain only the domain (and optionally path) of URLs; used for custom networks (e.g. author + domains)"
     extension = "csv"
+
+    # Allow on CSV/NDJSON datasets
+    compatibility = Compatibility(extensions={"csv", "ndjson"})
 
     # Common domain prefaces to remove
     domain_prefaces = ["m", "www"]
@@ -232,7 +236,7 @@ class ConsolidateURLs(BasicProcessor):
                 "requires": "method==custom"
             },
         }
-        
+
         # Get the columns for the select columns option
         if parent_dataset:
             columns = parent_dataset.get_columns()  # call once
@@ -247,23 +251,12 @@ class ConsolidateURLs(BasicProcessor):
 
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        This is meant to be inherited by other child classes
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.get_extension() in ["csv", "ndjson"]
-
     def process(self):
         method = self.parameters.get("method", False)
         url_parsing_issues = []
         column = self.parameters.get("column", False)
         if not method or not column:
-            self.dataset.update_status("Invalid parameters; ensure column and method are correct", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("Invalid parameters; ensure column and method are correct")
             return
         expand_urls = self.parameters.get("expand_urls", False)
 

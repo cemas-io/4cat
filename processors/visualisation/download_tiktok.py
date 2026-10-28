@@ -12,11 +12,11 @@ import requests
 
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.user_input import UserInput
-from datasources.tiktok_urls.search_tiktok_urls import TikTokScraper, RepeatedFailure
-from processors.visualisation.download_videos import VideoDownloaderPlus
+from datasources.tiktok_urls.search_tiktok_urls import TikTokScraper
 from datasources.tiktok.search_tiktok import SearchTikTok as SearchTikTokByImport
 from processors.visualisation.download_images import ImageDownloader
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 
 __author__ = "Dale Wahl"
@@ -24,159 +24,16 @@ __credits__ = ["Dale Wahl"]
 __maintainer__ = "Dale Wahl"
 __email__ = "4cat@oilab.eu"
 
-
-class TikTokVideoDownloader(BasicProcessor):
-    type = "video-downloader-tiktok"  # job type ID
-    category = "Visual"  # category
-    title = "Download TikTok Videos"  # title displayed in UI
-    description = "Downloads full videos for TikTok"
-    extension = "zip"
-    media_type = "video"
-
-    followups = VideoDownloaderPlus.followups
-
-    @classmethod
-    def get_options(cls, parent_dataset=None, config=None):
-        """
-        Get processor options
-
-        This method by default returns the class's "options" attribute, or an
-        empty dictionary. It can be redefined by processors that need more
-        fine-grained options, e.g. in cases where the availability of options
-        is partially determined by the parent dataset's parameters.
-
-        :param config:
-        :param DataSet parent_dataset:  An object representing the dataset that
-        the processor would be run on can be used to show some options only to
-        privileges users.
-        """
-        options = {
-            "amount": {
-                "type": UserInput.OPTION_TEXT,
-                "help": "No. of videos (max 1000)",
-                "default": 100,
-                "min": 0,
-                "max": 1000,
-                "tooltip": "Due to simultaneous downloads, you may end up with a few extra videos."
-            },
-        }
-
-        # Update the amount max and help from config
-        max_number_videos = int(config.get('video-downloader.max', 1000))
-        options['amount']['max'] = max_number_videos
-        options['amount']['help'] = f"No. of videos (max {max_number_videos:,})"
-
-        if parent_dataset:
-            if parent_dataset.type == "upload-search":
-                options["column"] = {
-                    "type": UserInput.OPTION_CHOICE,
-                    "help": "Column with TikTok Post IDs (not video URLs)",
-                    "options": {column: column for column in parent_dataset.get_columns()},
-                    "default": "id"
-                }
-
-        return options
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor TikTok datasets
-
-        :param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.type in ["tiktok-search", "tiktok-urls-search"] or (module.type == "upload-search" and "tiktok" in module.get_label().lower())
-
-    def process(self):
-        """
-        Reads a file, filtering items that match in the required way, and
-        creates a new dataset containing the matching values
-        """
-        if self.source_dataset.num_rows == 0:
-            self.dataset.update_status("No videos to download.", is_final=True)
-            self.dataset.finish(0)
-            return
-
-        # Process parameters
-        amount = self.parameters.get("amount") if self.parameters.get("amount") != 0 else self.source_dataset.num_rows
-        max_amount = min(amount, self.source_dataset.num_rows)
-        if self.source_dataset.type == "upload-search":
-            # Variable column name
-            column = self.parameters.get("column")
-        else:
-            column = "id"
-
-        # Prepare staging area for downloads
-        results_path = self.dataset.get_staging_area()
-
-        self.dataset.update_status("Downloading TikTok media")
-        video_ids_to_download = set()
-        for mapped_item in self.source_dataset.iterate_items(self):
-            post_id = mapped_item.get(column)
-            if not post_id:
-                continue
-            try:
-                # Test post ID is an integer (as TikTok post IDs ought to be)
-                int(post_id)
-            except ValueError:
-                self.dataset.finish_with_error(f"Column {column} must contain TikTok post IDs")
-                return
-            
-            video_ids_to_download.add(post_id)
-
-        # the downloader is an asynchronous method because we want to be able
-        # to run multiple downloads in parallel
-
-        tiktok_scraper = TikTokScraper(processor=self, config=self.config)
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(
-                tiktok_scraper.download_videos(list(video_ids_to_download), results_path, max_amount)
-            )
-        except RepeatedFailure as e:
-            if self.source_dataset.type == "upload-search":
-                self.dataset.finish_with_error(f"TikTok video downloader failed repeatedly. Please check that the column '{column}' contains valid TikTok post IDs. Error: {e}")
-            else:
-                self.log.warning(f"TikTok video downloader ({self.dataset.key}) failed repeatedly; may be parsing issue: {e}")
-                self.dataset.finish_with_error(f"TikTok video downloader failed repeatedly: {e}")
-            return
-
-        with results_path.joinpath(".metadata.json").open("w", encoding="utf-8") as outfile:
-            json.dump(results, outfile)
-
-        self.write_archive_and_finish(results_path, len([True for result in results.values() if result.get("success")]))
-
-    @staticmethod
-    def map_metadata(video_id, data):
-        """
-        Iterator to yield modified metadata for CSV
-
-        :param str video_id:  string that may contain URLs
-        :param dict data:  dictionary with metadata collected previously
-        :yield dict:  	  iterator containing reformated metadata
-        """
-        # TODO: could provide additional metadata via video downloader, but need to map those fields
-        filename = data.pop("files")[0].get("filename") if "files" in data else None
-        row = {
-            "video_id": video_id,
-            "filename": filename,
-            "success": data.get("success", "Metadata read error"),
-            "url": data.get("url", "Metadata read error"),
-            "error": data.get("error", "Metadata read error"),
-            "from_dataset": data.get("from_dataset", "Metadata read error"),
-            "post_ids": ", ".join(data.get("post_ids", ["Metadata read error"])),
-        }
-        yield row
-
 class TikTokImageDownloader(BasicProcessor):
     type = "image-downloader-tiktok"  # job type ID
     category = "Visual"  # category
-    title = "Download TikTok Images"  # title displayed in UI
+    title = "Download TikTok images"  # title displayed in UI
     description = "Downloads video/music thumbnails for TikTok; refreshes TikTok data if URLs have expired"
     extension = "zip"
     media_type = "image"
 
-    followups = ImageDownloader.followups
+    # Allow processor on TikTok datasets
+    compatibility = Compatibility(type_prefixes={"tiktok-"}, top_dataset_only=True, preferred_followups=ImageDownloader.followups)
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -227,24 +84,13 @@ class TikTokImageDownloader(BasicProcessor):
 
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor TikTok datasets
-
-        :param module: Dataset or processor to determine compatibility with
-        :param ConfigManager config:  Configuration reader (context-aware)
-        """
-        return module.type in ["tiktok-search", "tiktok-urls-search"]
-
     def process(self):
         """
         Reads a file, filtering items that match in the required way, and
         creates a new dataset containing the matching values
         """
         if self.source_dataset.num_rows == 0:
-            self.dataset.update_status("No images to download.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No images to download.")
             return
 
         # Process parameters
@@ -257,8 +103,7 @@ class TikTokImageDownloader(BasicProcessor):
         elif self.parameters.get("thumb_type") == "author_avatar":
             url_column = "author_avatar"
         else:
-            self.dataset.update_status("No image column selected.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_with_error("No image column selected.")
             return
 
         # Prepare staging area for downloads
@@ -308,8 +153,8 @@ class TikTokImageDownloader(BasicProcessor):
                         # Stop checking and refresh all remaining URLs
                         max_fails_exceeded += 1
                     else:
-                        self.dataset.update_status(f"Downloaded image for {url}")
                         downloaded_media += 1
+                        self.dataset.update_status(f"Downloaded image {downloaded_media}/{max_amount}")
 
                         metadata[url] = {
                                 "filename": filename,
@@ -396,7 +241,11 @@ class TikTokImageDownloader(BasicProcessor):
         with results_path.joinpath(".metadata.json").open("w", encoding="utf-8") as outfile:
             json.dump(metadata, outfile)
 
-        self.write_archive_and_finish(results_path, downloaded_media)
+        warning = None
+        if downloaded_media < max_amount:
+            warning = "Could not download all images."
+
+        self.write_archive_and_finish(results_path, downloaded_media, warning=warning)
 
     @staticmethod
     def save_image(image, image_name, directory_path):

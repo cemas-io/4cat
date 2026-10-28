@@ -2,27 +2,32 @@
 Basic post-processor worker - should be inherited by workers to post-process results
 """
 import traceback
+import inspect as py_inspect
 import zipfile
 import typing
 import shutil
+import copy
 import abc
 import csv
 import os
-import re
 import time
 
-from pathlib import PurePath
+from pathlib import PurePath, Path
 
 from backend.lib.worker import BasicWorker
-from common.lib.dataset import DataSet
+from common.lib.dataset import DataSet, StatusType
+from common.lib.compatibility import Compatibility
 from common.lib.fourcat_module import FourcatModule
-from common.lib.helpers import get_software_commit, remove_nuls, send_email, hash_to_md5
+from common.lib.helpers import get_software_commit, remove_nuls, send_email, hash_to_md5, looks_like_email_address
 from common.lib.exceptions import (WorkerInterruptedException, ProcessorInterruptedException, ProcessorException,
                                    DataSetException, MapItemException, AnnotationException)
 from common.config_manager import ConfigWrapper
 from common.lib.user import User
 
 csv.field_size_limit(1024 * 1024 * 1024)
+
+# Shared instance for the legacy default `compatibility`
+_DEFAULT_COMPATIBILITY = Compatibility(top_dataset_only=True)
 
 
 class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
@@ -35,10 +40,18 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
     be used as input for another processor (though whether and when this is
     useful is another question).
 
-    To determine whether a processor can process a given dataset, you can
-    define a `is_compatible_with(FourcatModule module=None, config=None):) -> bool` class
-    method which takes a dataset as argument and returns a bool that determines
-    if this processor is considered compatible with that dataset. For example:
+    To determine whether a processor can process a given dataset, declare a
+    Compatibility specification as the `compatibility` class attribute. The
+    default `is_compatible_with` is evaluated from it. For example:
+
+    .. code-block:: python
+
+        compatibility = Compatibility(types={"linguistic-features"})
+
+    Processors with genuinely dynamic requirements (e.g. ones that must inspect
+    a dataset's genealogy) may instead override `is_compatible_with(cls,
+    module=None, config=None) -> bool` directly; an override takes precedence
+    over the `compatibility` attribute. For example:
 
     .. code-block:: python
 
@@ -95,6 +108,11 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
     #: `remove_disposable_files()` method will be called.
     for_cleanup = None
 
+    #: A common.lib.compatibility.Compatibility object describing which datasets
+    #: this processor accepts. When set, the default is_compatible_with() is
+    #: evaluated from it.
+    compatibility = None
+
     def work(self):
         """
         Process a dataset
@@ -130,15 +148,15 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 # their data from. However, this should only be done as long as the
                 # preset is not finished yet, because after that there may be processors
                 # that run on the final preset result
-                while self.source_dataset.type.startswith("preset-") and not self.source_dataset.is_finished():
+                while self.source_dataset.is_preset() and not self.source_dataset.is_finished():
                     self.is_running_in_preset = True
                     self.source_dataset = self.source_dataset.get_parent()
                     if self.source_dataset is None:
                         # this means there is no dataset that is *not* a preset anywhere
                         # above this dataset. This should never occur, but if it does, we
                         # cannot continue
-                        self.log.error("Processor preset %s for dataset %s cannot find non-preset parent dataset",
-                                       (self.type, self.dataset.key))
+                        self.log.error("Processor preset %s for dataset %s cannot find non-preset parent dataset" % (
+                            self.type, self.dataset.key))
                         self.job.finish()
                         return
 
@@ -167,8 +185,12 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         self.dataset.clear_log()
         self.dataset.log("Processing '%s' started for dataset %s" % (processor_name, self.dataset.key))
 
-        # start log file
-        self.dataset.update_status("Processing data")
+        # remember the datasets above this one now, while they still exist, so
+        # they can be reported later if they are deleted while this runs
+        self.dataset.get_genealogy()
+
+        # start log file; update dataset status_type to processing
+        self.dataset.update_status("Processing data", status_type=StatusType.PROCESSING)
         self.dataset.update_version(get_software_commit(self))
 
         # we may create temporary files with the processor; anything in here
@@ -182,7 +204,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         # get parameters
         # if possible, fill defaults where parameters are not provided
         given_parameters = self.dataset.parameters.copy()
-        all_parameters = self.get_options(self.dataset, config=self.config)
+        all_parameters = self.get_options(self.source_dataset, config=self.config)
         self.parameters = {
             param: given_parameters.get(param, all_parameters.get(param, {}).get("default"))
             for param in [*all_parameters.keys(), *given_parameters.keys()]
@@ -211,10 +233,12 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 if not self.job.is_finished:
                     self.job.finish()
             except WorkerInterruptedException as e:
-                self.dataset.log("Processing interrupted (%s), trying again later" % str(e))
+                self.dataset.log("Processing interrupted: %s" % str(e))
+                self.dataset.update_status("Processing interrupted, trying again later", status_type=StatusType.QUEUED)
                 self.abort()
             except Exception as e:
-                self.dataset.log("Processor crashed (%s), trying again later" % str(e))
+                self.dataset.log("Processor crashed: %s" % str(e))
+                self.dataset.update_status("Processor error, trying again later", status_type=StatusType.QUEUED)
                 stack = traceback.extract_tb(e.__traceback__)
                 frames = [frame.filename.split("/").pop() + ":" + str(frame.lineno) for frame in stack[1:]]
                 location = "->".join(frames)
@@ -278,6 +302,13 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                         next_type, self.dataset.key))
 
             elif next_type in available_processors:
+                if self.interrupted == self.INTERRUPT_CANCEL:
+                    # this dataset is being deleted; a follow-up created now
+                    # would be left behind without a parent to attach it to
+                    self.log.info("Not running follow-up processor of type %s for dataset %s, dataset was cancelled" % (
+                        next_type, self.dataset.key))
+                    break
+
                 next_analysis = DataSet(
                     parameters=next_parameters,
                     type=next_type,
@@ -352,29 +383,46 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                     # already finished, could happen (though it shouldn't)
                     pass
 
-                surrogate.update_status(self.dataset.get_status())
+                # status updates of the steps are copied to the preset, so it usually has this status already;
+                # setting it again would only repeat the line in the preset's log
+                if surrogate.get_status() != self.dataset.get_status():
+                    surrogate.update_status(self.dataset.get_status())
+
+                # the steps of a preset are hidden, and their logs have more details than the preset's own
+                surrogate.log("Each step of this preset has its own log, with more details (e.g. why individual items failed):")
+                for step in surrogate.get_all_children():
+                    step_processor = step.get_producer_processor()
+                    step_name = step_processor.title if step_processor else step.type
+                    surrogate.log(f"  {step_name}: {step.get_log_url()}")
 
             except DataSetException:
                 # dataset with key to attach to doesn't exist...
-                self.log.warning("Cannot attach dataset chain containing %s to %s (dataset does not exist, may have "
-                                 "been deleted in the meantime)" % (self.dataset.key, self.parameters["attach_to"]))
+                try:
+                    # check if this running dataset still exists
+                    DataSet(key=self.dataset.key, db=self.db, modules=self.modules)
+                except DataSetException:
+                    # this dataset was deleted in process, we do not need to attach it to anything
+                    pass
+                else:
+                    # this dataset still exists, so it was left behind
+                    # without the dataset it was supposed to be attached to
+                    chain = " -> ".join(dataset.key for dataset in self.dataset.get_genealogy())
+                    self.log.warning("Cannot attach dataset chain containing %s to %s (dataset does not exist, but %s "
+                                     "does; chain when processing started: %s)" % (
+                        self.dataset.key, self.parameters["attach_to"], self.dataset.key, chain))
+
+        # Validate map_item against the freshly finished dataset and emit a
+        # single rolled-up admin alert if anything is unmappable. Fires once
+        # per dataset creation; later processors that iterate this dataset
+        # don't re-alert.
+        self._validate_map_item_post_run()
 
         self.job.finish()
 
         if self.config.get('mail.server') and self.dataset.get_parameters().get("email-complete", False):
             owner = self.dataset.get_parameters().get("email-complete", False)
             # Check that username is email address
-            if re.match(r"[^@]+\@.*?\.[a-zA-Z]+", owner):
-                from email.mime.multipart import MIMEMultipart
-                from email.mime.text import MIMEText
-                from smtplib import SMTPException
-                import socket
-                import html2text
-
-        if self.config.get('mail.server') and self.dataset.get_parameters().get("email-complete", False):
-            owner = self.dataset.get_parameters().get("email-complete", False)
-            # Check that username is email address
-            if re.match(r"[^@]+\@.*?\.[a-zA-Z]+", owner):
+            if looks_like_email_address(owner):
                 from email.mime.multipart import MIMEMultipart
                 from email.mime.text import MIMEText
                 from smtplib import SMTPException
@@ -588,7 +636,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 archive_file.extract(filename, staging_area)
                 return staging_area.joinpath(filename)
 
-    def write_csv_items_and_finish(self, data):
+    def write_csv_items_and_finish(self, data, warning=None):
         """
         Write data as csv to results file and finish dataset
 
@@ -598,6 +646,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         processor is set while iterating.
 
         :param data: A list or tuple of dictionaries, all with the same keys
+        :param str | None warning: An optional warning. Will set the dataset type to 'warning'.
         """
         if not (isinstance(data, typing.List) or isinstance(data, typing.Tuple) or callable(data)) or isinstance(data, str):
             raise TypeError("write_csv_items requires a list or tuple of dictionaries as argument (%s given)" % type(data))
@@ -619,10 +668,13 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
 
                 writer.writerow(row)
 
-        self.dataset.update_status("Finished")
-        self.dataset.finish(len(data))
+        if not warning:
+            self.dataset.update_status("Finished")
+            self.dataset.finish(len(data))
+        else:
+            self.dataset.finish_with_warning(len(data), warning)
 
-    def write_archive_and_finish(self, files, num_items=None, compression=zipfile.ZIP_STORED, finish=True):
+    def write_archive_and_finish(self, files, num_items=None, compression=zipfile.ZIP_STORED, finish=True, warning=None):
         """
         Archive a bunch of files into a zip archive and finish processing
 
@@ -634,6 +686,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         :param int compression:  Type of compression to use. By default, files
           are not compressed, to speed up unarchiving.
         :param bool finish:  Finish the dataset/job afterwards or not?
+        :param str | None warning: An optional warning. Will set the dataset type to 'warning'.
         """
         is_folder = False
         if issubclass(type(files), PurePath):
@@ -656,12 +709,14 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         if is_folder:
             shutil.rmtree(is_folder)
 
-        self.dataset.update_status("Finished")
         if num_items is None:
             num_items = done
 
-        if finish:
+        if finish and not warning:
+            self.dataset.update_status("Finished")
             self.dataset.finish(num_items)
+        elif finish and warning:
+            self.dataset.finish_with_warning(num_items, warning)
 
     def create_standalone(self, item_ids=None):
         """
@@ -733,7 +788,8 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         except AttributeError:
             standalone.board = self.type
 
-        standalone.type = top_parent.type
+        standalone.adopt_type(top_parent.type)
+        standalone.media_type = top_parent.get_media_type()
 
         standalone.detach()
         standalone.delete_parameter("key_parent")
@@ -878,12 +934,110 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         try:
             mapped_item = cls.map_item(item)
         except (KeyError, IndexError) as e:
-            raise MapItemException(f"Unable to map item: {type(e).__name__}-{e}")
+            # Walk the traceback to find the deepest frame inside the
+            # datasource's own map_item file, so the wrapped exception
+            # points at the access that failed rather than this line.
+            tb_frames = traceback.extract_tb(e.__traceback__)
+            chosen_frame = tb_frames[-1] if tb_frames else None
+            try:
+                map_item_file = Path(py_inspect.getfile(cls)).resolve()
+            except (TypeError, OSError):
+                map_item_file = None
+            if map_item_file is not None:
+                for frame in reversed(tb_frames):
+                    try:
+                        if Path(frame.filename).resolve() == map_item_file:
+                            chosen_frame = frame
+                            break
+                    except OSError:
+                        continue
+            raise MapItemException(f"Unable to map item: {type(e).__name__}-{e}", frame=chosen_frame)
 
         if not mapped_item:
             raise MapItemException("Unable to map item!")
 
         return mapped_item
+
+    def _validate_map_item_post_run(self):
+        """
+        Walk the just-finished dataset and run `map_item` over each item,
+        rolling up any failures into a single admin alert via
+        `DataSet.warn_unmappable_signatures`. Fires at at creation time, 
+        immediately after the dataset is marked finished and before this 
+        worker frees its queue slot.
+
+        Wrapped so a validation failure can never fail the dataset itself.
+
+        This holds the current worker's queue slot for the duration of the
+        iteration. Subsequent processors are unaffected — they pick up the
+        now-finished dataset on other workers. If this becomes a measurable
+        bottleneck for very large datasets, revisit moving to a daemon
+        thread or a dedicated validator worker.
+        """
+        try:
+            # Only run validation if the dataset is finished, has rows, and the processor
+            # has a compatible map_item method.
+            if not self.dataset.is_finished():
+                return
+            if self.dataset.data.get("num_rows", 0) <= 0:
+                return
+            if not self.map_item_method_available(dataset=self.dataset):
+                return
+
+            signatures = {}
+            for i, item in enumerate(self.dataset._iterate_items(processor=self)):
+                try:
+                    self.get_mapped_item(item)
+                except MapItemException as e:
+                    frame = getattr(e, "frame", None)
+                    fname = Path(frame.filename).name if frame and getattr(frame, "filename", None) else "?"
+                    lineno = getattr(frame, "lineno", 0) if frame else 0
+                    sig = signatures.setdefault(
+                        (fname, lineno),
+                        {"count": 0, "error": str(e), "samples": []}
+                    )
+                    sig["count"] += 1
+                    if len(sig["samples"]) < 3:
+                        sig["samples"].append(i)
+                except Exception:
+                    # Unexpected exception type — don't let it kill validation
+                    continue
+
+            if signatures:
+                self.dataset.warn_unmappable_signatures(processor=self, signatures=signatures)
+        except Exception as e:
+            # Validation must never fail the dataset
+            try:
+                self.log.warning(f"map_item validation hook failed for dataset {self.dataset.key}: {e}")
+            except Exception:
+                pass
+
+    @classmethod
+    def is_compatible_with(cls, module=None, config=None):
+        """
+        Determine whether this processor can run on a given module.
+
+        When the processor defines a `compatibility` attribute, this is
+        evaluated from it. Processors whose requirements cannot be expressed
+        that way (for example, ones that must inspect a dataset's ancestry) may
+        override this method instead; the override is used in preference to the
+        attribute.
+
+        When neither is provided, the processor accepts only top-level datasets
+        (those without a parent), which preserves the historical default.
+
+        :param module:  Dataset (normally) or processor to check against
+        :param ConfigManager|None config:  Context-aware configuration reader
+        :return bool:
+        """
+        if cls.compatibility is not None:
+            return cls.compatibility.is_compatible_with(module, config=config)
+
+        # Legacy default: a processor that declares no `compatibility` and does
+        # not override this method is compatible only with top-level datasets
+        # (those with no parent), i.e. it runs on collected data and not on the
+        # output of other processors.
+        return _DEFAULT_COMPATIBILITY.is_compatible_with(module, config=config)
 
     @classmethod
     def is_filter(cls):
@@ -896,17 +1050,18 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         :todo: Make this a bit more robust than sniffing the processor category
         :return bool:
         """
-        return hasattr(cls, "category") and cls.category and "filter" in cls.category.lower()
+        return (hasattr(cls, "category") and cls.category and "filter" in cls.category.lower()) or (hasattr(cls, "filter") and cls.filter)
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
         """
         Get processor options
 
-        This method by default returns the class's "options" attribute, or an
-        empty dictionary. It can be redefined by processors that need more
-        fine-grained options, e.g. in cases where the availability of options
-        is partially determined by the parent dataset's parameters.
+        This method by default returns an empty dictionary. Processors should
+        override this method to return their options. The deprecated `options`
+        class attribute is still supported for backwards compatibility (returned
+        as a deep copy to prevent mutation), but `get_options()` should always
+        be used instead.
 
         :param parent_dataset DataSet:  An object representing the dataset that
             the processor would be or was run on. Can be used, in conjunction with
@@ -915,7 +1070,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         :return dict:   Options for this processor
         """
 
-        return cls.options if hasattr(cls, "options") else {}
+        return copy.deepcopy(cls.options) if hasattr(cls, "options") else {}
 
     @classmethod
     def get_status(cls):
@@ -986,19 +1141,18 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
     @classmethod
     def exclude_followup_processors(cls, processor_type=None):
         """
-        Used for processor compatibility
+        Determine whether a follow-up processor should be excluded.
 
-        To be defined by the child processor if it should exclude certain follow-up processors.
-        e.g.:
+        Follow-up processors that should never be offered after this one are
+        listed in the `excluded_followups` field of the `compatibility`
+        specification. Processors with dynamic exclusion logic may override this
+        method instead.
 
-        def exclude_followup_processors(cls, processor_type):
-            if processor_type in ["undesirable-followup-processor"]:
-                return True
-            return False
-
-        :param str processor_type:  Processor type to exclude
-        :return bool:  True if processor should be excluded, False otherwise
+        :param str processor_type:  Processor type to check
+        :return bool:  True if the follow-up should be excluded, False otherwise
         """
+        if cls.compatibility is not None and processor_type in cls.compatibility.excluded_followups:
+            return True
         return False
 
     @abc.abstractmethod
@@ -1021,3 +1175,12 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         :return:  True
         """
         return True
+    
+    @staticmethod
+    def is_preset():
+        """
+        Is this processor a preset?
+
+        :return:  False
+        """
+        return False

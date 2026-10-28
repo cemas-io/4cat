@@ -6,6 +6,7 @@ import csv
 
 from common.lib.exceptions import ProcessorInterruptedException
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
 
 __author__ = "Sal Hagen"
@@ -21,9 +22,12 @@ class ConvertText(BasicProcessor):
     type = "convert-text"  # job type ID
     category = "Conversion"  # category
     title = "Replace text"  # title displayed in UI
-    description = ("Find and replace text in selected fields and and output these in a new dataset. Changed text can "
+    description = ("Find text in selected fields, replace parts of it, and write to a new dataset. Converted texts can "
                    "also be added to the original dataset as annotations.")  # description displayed in UI
     extension = "csv"
+
+    # Allow on CSV/NDJSON datasets
+    compatibility = Compatibility(extensions={"csv", "ndjson"})
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -38,7 +42,7 @@ class ConvertText(BasicProcessor):
                 "type": UserInput.OPTION_TEXT,
                 "default": "",
                 "help": "Text to replace",
-                "tooltip": "Multiple values can be replaced, separate with comma.",
+                "tooltip": "Multiple values can be replaced; separate with comma.",
             },
             "as_regex": {
                 "type": UserInput.OPTION_TOGGLE,
@@ -82,16 +86,6 @@ class ConvertText(BasicProcessor):
                                                                                     key=lambda
                                                                                         k: "text" in k).pop()
         return options
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on NDJSON and CSV files
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.get_extension() in ("csv", "ndjson")
 
     def process(self):
         """

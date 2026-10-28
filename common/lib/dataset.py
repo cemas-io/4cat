@@ -10,6 +10,10 @@ import time
 import csv
 import re
 import os
+import errno
+from enum import Enum
+from pathlib import Path
+from natsort import natsorted
 
 from common.lib.annotation import Annotation
 from common.lib.job import Job, JobNotFoundException
@@ -20,6 +24,14 @@ from common.lib.fourcat_module import FourcatModule
 from common.lib.exceptions import (ProcessorInterruptedException, DataSetException, DataSetNotFoundException,
                                    MapItemException, MappedItemIncompleteException, AnnotationException)
 
+
+class StatusType(Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    SUCCESS = "finished"
+    EMPTY = "empty"
+    WARNING = "warning"
+    ERROR = "error"
 
 class DataSet(FourcatModule):
     """
@@ -42,6 +54,7 @@ class DataSet(FourcatModule):
 
     _children = None
     available_processors = None
+    _available_processors_config = None # last known config for available_processors, so we can check if it needs to be refreshed
     _genealogy = None
     preset_parent = None
     parameters = None
@@ -71,7 +84,8 @@ class DataSet(FourcatModule):
             type=None,
             is_private=True,
             owner="anonymous",
-            modules=None
+            modules=None,
+            check_owners=True
     ):
         """
         Create new dataset object
@@ -99,13 +113,16 @@ class DataSet(FourcatModule):
         :param modules: Module cache. If not given, will be loaded when needed
         (expensive). Used to figure out what processors are compatible with
         this dataset.
+        :param bool check_owners:  Update owner cache on instantiation. This
+        requires database querying, so may be useful to disable when
+        instantiating datasets in bulk. Ignored if `key` is set.
         """
         self.db = db
 
         # Ensure mutable attributes are set in __init__ as they are unique to each DataSet
         self.data = {}
         self.parameters = {}
-        self.available_processors = {}
+        self.available_processors = None
         self._genealogy = None
         self.disposable_files = []
         self.modules = modules
@@ -172,6 +189,7 @@ class DataSet(FourcatModule):
                 "parameters": json.dumps(parameters),
                 "result_file": "",
                 "creator": owner,
+                "status_type": StatusType.QUEUED.value,
                 "status": "",
                 "type": type,
                 "timestamp": int(time.time()),
@@ -207,7 +225,8 @@ class DataSet(FourcatModule):
             # Reserve filename and update data['result_file']
             self.reserve_result_file(parameters, extension)
 
-        self.refresh_owners()
+        if check_owners:
+            self.refresh_owners()
 
     def check_dataset_finished(self):
         """
@@ -341,6 +360,16 @@ class DataSet(FourcatModule):
                     if i < offset:
                         continue
 
+                    # csv.DictReader does not fail on a row with more values
+                    # than the file has columns, but puts the extra values
+                    # under the key None. Nothing that reads items expects
+                    # that key, so stop here and say where the file is broken
+                    if None in item:
+                        raise DataSetException(
+                            f"Cannot read dataset {self.key}: line {reader.line_num} of its CSV file has "
+                            f"{len(item[None])} more value(s) than the file has columns"
+                        )
+
                     yield item
 
         elif path.suffix.lower() == ".ndjson":
@@ -403,10 +432,30 @@ class DataSet(FourcatModule):
             raise RuntimeError(f"Staging area {staging_area} is not a valid folder")
 
         iterations = 0
+
+        def metadata_priority_sort(file):
+            """
+            Sorting key that always prioritises dotfiles
+
+            natsort (see below) will sort very well, but puts filenames
+            starting with a number (e.g. `15file.png`) before dotfiles. This
+            key function avoids that by prepending non-dotfiles with the string
+            "file_" so they are still sorted equally, but always behind
+            dotfiles.
+
+            :param ZipInfo file:  Archive file object
+            :return str:  Filename to use for sorting
+            """
+            if not file.filename.startswith("."):
+                return "file_" + file.filename
+            return file.filename
+
         with zipfile.ZipFile(path, "r") as archive_file:
             # sorting is important because it ensures .metadata.json is read
-            # first
-            archive_contents = sorted(archive_file.infolist(), key=lambda x: x.filename)
+            # first, and returns numbered items in the correct order
+            # for the latter purpose, we use natural sorting rather than
+            # python's built-in sorting
+            archive_contents = natsorted(archive_file.infolist(), key=metadata_priority_sort)
             for archived_file in archive_contents:
 
                 if filename_filter and archived_file.filename not in filename_filter:
@@ -483,14 +532,18 @@ class DataSet(FourcatModule):
         :param max_unmappable:  Skip at most this many unmappable items; if
         more are encountered, stop iterating. `None` to never stop.
         :param map_missing: Indicates what to do with mapped items for which
-        some fields could not be mapped. Defaults to 'empty_str'. Must be one of:
+        some fields could not be mapped. Defaults to 'default'. Must be one of:
         - 'default': fill missing fields with the default passed by map_item
+        - 'keep': leave the MissingMappedField sentinel in place so the caller
+          can tell which fields were missing (useful for JSON serialisation
+          via MissingMappedFieldEncoder)
         - 'abort': raise a MappedItemIncompleteException if a field is missing
         - a callback: replace missing field with the return value of the
           callback. The MappedItem object is passed to the callback as the
           first argument and the name of the missing field as the second.
         - a dictionary with a key for each possible missing field: replace missing
-          field with a strategy for that field ('default', 'abort', or a callback)
+          field with a strategy for that field ('default', 'keep', 'abort', or
+          a callback)
         :param get_annotations: Whether to also fetch annotations from the database.
           This can be disabled to help speed up iteration.
         :param offset: After how many rows we should yield items.
@@ -533,6 +586,42 @@ class DataSet(FourcatModule):
                     unique_label = f"{annotation_field_items['label']}_{counter}"
                 annotation_labels[annotation_field_id] = unique_label
 
+            def add_annotations(dataset_items):
+                """
+                Get the annotations for a batch of items in one go and add
+                them to each item, under the annotation's label
+                """
+                item_ids = [dataset_item.get("id") for dataset_item in dataset_items]
+
+                # Dict with item ids for fast lookup
+                annotations_dict = collections.defaultdict(dict)
+                annotations = self.get_annotations_for_item(item_ids, before=annotations_before)
+                for item_annotation in annotations:
+                    item_id = item_annotation.item_id
+                    if item_annotation:
+                        annotations_dict[item_id][item_annotation.field_id] = item_annotation.value
+
+                # Process each dataset item
+                for dataset_item in dataset_items:
+                    item_id = dataset_item.get("id")
+                    item_annotations = annotations_dict.get(item_id, {})
+
+                    for annotation_field_id, annotation_field_items in annotation_fields.items():
+                        # Get annotation value
+                        value = item_annotations.get(annotation_field_id, "")
+
+                        # Convert list to string if needed
+                        if isinstance(value, list):
+                            value = ",".join(value)
+                        elif value != "":
+                            value = str(value)  # Ensure string type
+                        else:
+                            value = ""
+
+                        dataset_item[annotation_labels[annotation_field_id]] = value
+
+                return dataset_items
+
         # missing field strategy can be for all fields at once, or per field
         # if it is per field, it is a dictionary with field names and their strategy
         # if it is for all fields, it may be a callback, 'abort', or 'default'
@@ -541,7 +630,11 @@ class DataSet(FourcatModule):
             default_strategy = map_missing
             map_missing = {}
 
-        iterator = self._iterate_items if self.get_extension() != "zip" else self._iterate_archive_contents
+        extension = self.get_extension()
+        if extension is False:
+            raise FileNotFoundError(f"Results file for dataset {self.key} does not exist: {self.get_results_path()}")
+
+        iterator = self._iterate_items if extension != "zip" else self._iterate_archive_contents
 
         # Loop through items
         for i, item in enumerate(iterator(processor=processor, offset=offset, *args, **kwargs)):
@@ -554,9 +647,8 @@ class DataSet(FourcatModule):
                     mapped_item = own_processor.get_mapped_item(item)
                 except MapItemException as e:
                     if warn_unmappable:
-                        self.warn_unmappable_item(
-                            i, processor, e, warn_admins=unmapped_items is False
-                        )
+                        # Update dataset log for unmappable items.
+                        self.warn_unmappable_item(i, processor, e)
 
                     unmapped_items += 1
                     if max_unmappable and unmapped_items > max_unmappable:
@@ -575,6 +667,10 @@ class DataSet(FourcatModule):
                             mapped_item.data[missing_field] = strategy(
                                 mapped_item.data, missing_field
                             )
+                        elif strategy == "keep":
+                            # leave the MissingMappedField in place so the
+                            # caller can distinguish missing from present
+                            continue
                         elif strategy == "abort":
                             # raise an exception to be handled at the processor level
                             raise MappedItemIncompleteException(
@@ -587,7 +683,7 @@ class DataSet(FourcatModule):
                             ].value
                         else:
                             raise ValueError(
-                                "map_missing must be 'abort', 'default', or a callback."
+                                "map_missing must be 'abort', 'default', 'keep', or a callback."
                             )
             else:
                 mapped_item = original_item
@@ -609,45 +705,21 @@ class DataSet(FourcatModule):
             if get_annotations:
                 dataset_item_cache.append(dataset_item)
 
-                # When we reach the batch limit or the end of the dataset,
-                # get the annotations for cached items and yield the entire thing.
-                if len(dataset_item_cache) >= item_batch_size or i == (self.num_rows - 1):
-
-                    item_ids = [dataset_item.get("id") for dataset_item in dataset_item_cache]
-
-                    # Dict with item ids for fast lookup
-                    annotations_dict = collections.defaultdict(dict)
-                    annotations = self.get_annotations_for_item(item_ids, before=annotations_before)
-                    for item_annotation in annotations:
-                        item_id = item_annotation.item_id
-                        if item_annotation:
-                            annotations_dict[item_id][item_annotation.field_id] = item_annotation.value
-
-                    # Process each dataset item
-                    for dataset_item in dataset_item_cache:
-                        item_id = dataset_item.get("id")
-                        item_annotations = annotations_dict.get(item_id, {})
-
-                        for annotation_field_id, annotation_field_items in annotation_fields.items():
-                            # Get annotation value
-                            value = item_annotations.get(annotation_field_id, "")
-
-                            # Convert list to string if needed
-                            if isinstance(value, list):
-                                value = ",".join(value)
-                            elif value != "":
-                                value = str(value)  # Ensure string type
-                            else:
-                                value = ""
-
-                            dataset_item[annotation_labels[annotation_field_id]] = value
-
-                        yield dataset_item
-
+                # When we reach the batch limit, get the annotations for cached
+                # items and yield the entire thing.
+                if len(dataset_item_cache) >= item_batch_size:
+                    yield from add_annotations(dataset_item_cache)
                     dataset_item_cache = []
 
             else:
                 yield dataset_item
+
+        # Yield the last batch, which is usually not full. This happens after
+        # the loop, so it also works when the last items could not be mapped,
+        # when we stopped early because of too many unmappable items, or when
+        # the dataset has fewer items than its row count says.
+        if get_annotations and dataset_item_cache:
+            yield from add_annotations(dataset_item_cache)
 
 
     def sort_and_iterate_items(
@@ -854,19 +926,70 @@ class DataSet(FourcatModule):
 
         results_dir_base = results_file.parent
         results_dir = results_file.name.replace(".", "") + "-staging"
-        results_path = results_dir_base.joinpath(results_dir)
-        index = 1
-        while results_path.exists():
-            results_path = results_dir_base.joinpath(results_dir + "-" + str(index))
-            index += 1
 
-        # create temporary folder
-        results_path.mkdir()
+        index = 1
+        # Try creating the staging directory; if a concurrent process created
+        # it between the exists() check and mkdir(), handle the EEXIST error
+        # by incrementing the index and retrying to avoid race conditions.
+        while True:
+            suffix = "" if index == 1 else f"-{index}"
+            results_path = results_dir_base.joinpath(results_dir + suffix)
+            try:
+                results_path.mkdir()
+                break
+            except OSError as e:
+                if getattr(e, 'errno', None) == errno.EEXIST:
+                    index += 1
+                    continue
+                raise
 
         # Storing the staging area with the dataset so that it can be removed later
         self.disposable_files.append(results_path)
 
         return results_path
+
+    def extract_file_from_archive(self, member, staging_area=None, archive_path=None):
+        """
+        Extract a single member from this dataset's results archive (or an
+        explicitly provided archive path) into a staging area and return the
+        Path to the extracted file. If the member does not exist, return
+        ``None``.
+
+        :param str member: The path of the member inside the archive
+        :param Path staging_area: Optional staging area to extract into
+        :param archive_path: Optional path to the archive file to extract from
+        :return Path|None: Path to extracted file or None if not found
+        """
+        if not member:
+            return None
+
+        # Reject absolute paths and traversal in the member path
+        if Path(member).is_absolute() or ".." in Path(member).parts:
+            raise ValueError("Invalid member path.")
+
+        # Determine archive path (use provided archive_path if given)
+        path = Path(archive_path) if archive_path is not None else self.get_results_path()
+        if not path.exists():
+            return None
+
+        if not staging_area:
+            staging_area = self.get_staging_area()
+
+        if not staging_area.exists() or not staging_area.is_dir():
+            raise RuntimeError(f"Staging area {staging_area} is not a valid folder")
+
+        with zipfile.ZipFile(str(path), "r") as archive_file:
+            # Zip member names are stored with forward slashes
+            namelist = archive_file.namelist()
+            if member not in namelist:
+                return None
+
+            # Ensure parent directories exist in staging area
+            extract_path = staging_area.joinpath(member)
+            extract_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_file.extract(member, staging_area)
+
+            return extract_path
 
     def remove_disposable_files(self):
         """
@@ -880,12 +1003,22 @@ class DataSet(FourcatModule):
                 if disposable_file.exists():
                     shutil.rmtree(disposable_file)
 
-    def finish(self, num_rows=0):
+    def finish(self, num_rows=0, status_type=None):
         """
         Declare the dataset finished
+
+        :param int num_rows:  Number of rows in the dataset
+        :param StatusType status_type:  Status type to set the dataset to.
+          If omitted, set to SUCCESS if num_rows > 0, else EMPTY
         """
+        # Without this guard, a second finish() silently overwrites status_type (e.g. WARNING → SUCCESS).
         if self.data["is_finished"]:
             raise RuntimeError("Cannot finish a finished dataset again")
+        
+        if status_type is None:
+            status_type = StatusType.SUCCESS if num_rows > 0 else StatusType.EMPTY
+        elif not isinstance(status_type, StatusType):
+            raise ValueError("status_type must be a StatusType enum value")
 
         self.db.update(
             "datasets",
@@ -894,11 +1027,13 @@ class DataSet(FourcatModule):
                 "is_finished": True,
                 "num_rows": num_rows,
                 "progress": 1.0,
+                "status_type": status_type.value,
                 "timestamp_finished": int(time.time()),
             },
         )
         self.data["is_finished"] = True
         self.data["num_rows"] = num_rows
+        self.data["status_type"] = status_type.value
 
     def copy(self, shallow=True):
         """
@@ -948,7 +1083,7 @@ class DataSet(FourcatModule):
 
         return copy
 
-    def delete(self, commit=True, queue=None):
+    def delete(self, commit=True, delete_log=False):
         """
         Delete the dataset, and all its children
 
@@ -956,32 +1091,25 @@ class DataSet(FourcatModule):
         a dataset object after it has been deleted is undefined behaviour.
 
         :param bool commit:  Commit SQL DELETE query?
+        :param bool delete_log:  Whether to also delete the log file. Defaults to False, 
+        because logs can be useful for debugging even after a dataset is deleted. Hanging logs
+        are automatically deleted by TempFileCleaner after a certain amount of time.
         """
-        # first, recursively delete children
-        children = self.db.fetchall(
-            "SELECT * FROM datasets WHERE key_parent = %s", (self.key,)
-        )
-        for child in children:
-            try:
-                child = DataSet(key=child["key"], db=self.db, modules=self.modules)
-                child.delete(commit=commit)
-            except DataSetException:
-                # dataset already deleted - race condition?
-                pass
-
-        # delete any queued jobs for this dataset
+        # first, stop any job for this dataset.
+        # a running processor can still create a follow-up dataset until it is told to stop, 
+        # and a child created after the lookup below would not be deleted
         try:
             job = Job.get_by_remote_ID(self.key, self.db, self.type)
             if job.is_claimed:
                 # tell API to stop any jobs running for this dataset
                 # level 2 = cancel job
-                # we're not interested in the result - if the API is available,
-                # it will do its thing, if it's not the backend is probably not
-                # running so the job also doesn't need to be interrupted
+                # we must wait for the API to process the request before deleting
+                # the job record from the database; if we fire-and-forget the job
+                # row is gone by the time the API looks it up, causing
+                # JobNotFoundException and leaving the worker running uninterrupted
                 call_api(
                     "cancel-job",
                     {"remote_id": self.key, "jobtype": self.type, "level": 2},
-                    False,
                 )
 
             # this deletes the job from the database
@@ -989,6 +1117,18 @@ class DataSet(FourcatModule):
 
         except JobNotFoundException:
             pass
+
+        # then, recursively delete children
+        children = self.db.fetchall(
+            "SELECT * FROM datasets WHERE key_parent = %s", (self.key,)
+        )
+        for child in children:
+            try:
+                child = DataSet(key=child["key"], db=self.db, modules=self.modules)
+                child.delete(commit=commit, delete_log=delete_log)
+            except DataSetException:
+                # dataset already deleted - race condition?
+                pass
 
         # delete this dataset's own annotations
         self.db.delete("annotations", where={"dataset": self.key}, commit=commit)
@@ -1012,20 +1152,29 @@ class DataSet(FourcatModule):
         self.db.delete("users_favourites", where={"key": self.key}, commit=commit)
 
         # delete from drive
+        files_to_delete = [self.get_results_path()] + ([self.get_results_path().with_suffix(".log")] if delete_log else [])
+        for path in files_to_delete:
+            try:
+                if path.exists():
+                    path.unlink()
+            except FileNotFoundError:
+                # already deleted, apparently
+                pass
+            except PermissionError as e:
+                self.db.log.error(
+                    f"Could not delete dataset {self.key} file {path}; it may need to be deleted manually: {e}"
+                )
+
+        # delete results folder if it exists
         try:
-            if self.get_results_path().exists():
-                self.get_results_path().unlink()
-            if self.get_results_path().with_suffix(".log").exists():
-                self.get_results_path().with_suffix(".log").unlink()
             if self.get_results_folder_path().exists():
                 shutil.rmtree(self.get_results_folder_path())
-
         except FileNotFoundError:
             # already deleted, apparently
             pass
         except PermissionError as e:
             self.db.log.error(
-                f"Could not delete all dataset {self.key} files; they may need to be deleted manually: {e}"
+                f"Could not delete dataset {self.key} results folder; it may need to be deleted manually: {e}"
             )
 
     def update_children(self, **kwargs):
@@ -1304,7 +1453,7 @@ class DataSet(FourcatModule):
         except json.JSONDecodeError:
             return {}
 
-    def get_columns(self):
+    def get_columns(self, annotation_columns=True):
         """
         Returns the dataset columns.
 
@@ -1329,7 +1478,7 @@ class DataSet(FourcatModule):
             items = self.iterate_items(warn_unmappable=False, get_annotations=False, max_unmappable=100)
             try:
                 keys = list(next(items).keys())
-                if self.annotation_fields:
+                if self.annotation_fields and annotation_columns:
                     for annotation_field in self.annotation_fields.values():
                         annotation_column = annotation_field["label"]
                         label_count = 1
@@ -1465,6 +1614,7 @@ class DataSet(FourcatModule):
             query_bit = self.data["query"].replace(" ", "-").lower()
             query_bit = re.sub(r"[^a-z0-9\-]", "", query_bit)
             query_bit = query_bit[:100]  # Crop to avoid OSError
+            query_bit = query_bit.strip("-")  # Remove leading/trailing dashes that might have been introduced by the previous steps
             file = query_bit + "-" + self.data["key"]
             file = re.sub(r"[-]+", "-", file)
 
@@ -1563,7 +1713,7 @@ class DataSet(FourcatModule):
         """
         return self.data["status"]
 
-    def update_status(self, status, is_final=False):
+    def update_status(self, status, is_final=False, status_type=None):
         """
         Update dataset status
 
@@ -1578,27 +1728,37 @@ class DataSet(FourcatModule):
         :param bool is_final:  If this is `True`, subsequent calls to this
         method while the object is instantiated will not update the dataset
         status.
+        :param StatusType|None status_type:  Type of status. If provided, this updates
+        the `status_type` field of the dataset as well.
         :return bool:  Status update successful?
         """
         if self.no_status_updates:
             return
+        
+        if status_type is not None and not isinstance(status_type, StatusType):
+            raise ValueError("status_type must be a StatusType enum value")
 
         # for presets, copy the updated status to the preset(s) this is part of
         if self.preset_parent is None:
             self.preset_parent = [
                                      parent
                                      for parent in self.get_genealogy()
-                                     if parent.type.find("preset-") == 0 and parent.key != self.key
+                                     if parent.is_preset() and parent.key != self.key
                                  ][:1]
 
         if self.preset_parent:
             for preset_parent in self.preset_parent:
                 if not preset_parent.is_finished():
-                    preset_parent.update_status(status)
+                    preset_parent.update_status(status, status_type=status_type)
 
+        # Update own status
+        status_data = {"status": status}
+        if status_type is not None:
+            self.data["status_type"] = status_type.value
+            status_data["status_type"] = status_type.value
         self.data["status"] = status
         updated = self.db.update(
-            "datasets", where={"key": self.data["key"]}, data={"status": status}
+            "datasets", where={"key": self.data["key"]}, data=status_data
         )
 
         if is_final:
@@ -1636,7 +1796,7 @@ class DataSet(FourcatModule):
         """
         return self.data["progress"]
 
-    def finish_with_error(self, error):
+    def finish_with_error(self, error: str) -> None:
         """
         Set error as final status, and finish with 0 results
 
@@ -1647,7 +1807,42 @@ class DataSet(FourcatModule):
         :return:
         """
         self.update_status(error, is_final=True)
-        self.finish(0)
+        self.finish(0, status_type=StatusType.ERROR)
+
+        return None
+
+    def finish_with_warning(self, num_rows: int, warning: str) -> None:
+        """
+        Indicate this dataset has finished with a warning. This needs
+        the number of completed rows. If `num_rows` is zero, status_type
+        will be set to "error" as the dataset did not write anything and
+        is considered failed.
+
+        :param str num_rows:  How many rows succeeded.
+        :param str warning:  Warning message for final dataset status.
+        :return:
+        """
+
+        if not isinstance(num_rows, int):
+            raise ValueError("num_rows must be a positive integer")
+        if num_rows <= 0:
+            self.finish_with_error(warning)
+            return
+
+        self.update_status(warning, is_final=True)
+        self.finish(num_rows, status_type=StatusType.WARNING)
+
+        return None
+
+    def finish_as_empty(self, status_message):
+        """
+        Indicate this dataset has finished with no results and a message
+
+        :param str status_message: The message to show.
+        :return:
+        """
+        self.update_status(status_message, is_final=True)
+        self.finish(0, status_type=StatusType.EMPTY)
 
         return None
 
@@ -1874,11 +2069,9 @@ class DataSet(FourcatModule):
             ):
                 continue
 
-            # consider a processor compatible if its is_compatible_with
-            # method returns True *or* if it has no explicit compatibility
-            # check and this dataset is top-level (i.e. has no parent)
-            if (not hasattr(processor, "is_compatible_with") and not self.key_parent) \
-                    or (hasattr(processor, "is_compatible_with") and processor.is_compatible_with(self, config=config)):
+            # evaluates processor's declarative `compatibility`
+            # undeclared processors default to top-level-only
+            if processor.is_compatible_with(self, config=config):
                 available[processor_type] = processor
 
         return available
@@ -1913,13 +2106,76 @@ class DataSet(FourcatModule):
 
     def get_own_processor(self):
         """
-        Get the processor class that produced this dataset
+        Get the processor class corresponding to this dataset's data shape.
+
+        Normally this is the processor that produced the dataset, but for
+        datasets whose `type` was adopted from another datasource (e.g. by a
+        filter that copies its parent's NDJSON content verbatim), this is the
+        processor whose `map_item` / extension match the result file's
+        contents -- not necessarily the producing processor. See
+        `get_producer_processor` for the latter.
 
         :return:  Processor class, or `None` if not available.
         """
         processor_type = self.parameters.get("type", self.data.get("type"))
 
         return self.modules.processors.get(processor_type)
+
+    def get_media_request_headers(self):
+        """
+        Get extra headers to send when downloading images or videos linked in
+        this dataset
+
+        These come from the data source the data was collected with, which is
+        found via the top dataset, since this dataset may itself be made from
+        that data (e.g. by a processor).
+
+        :return dict:  Headers; empty if the data source needs none
+        """
+        data_source = self.top_parent().get_own_processor()
+        return dict(getattr(data_source, "media_request_headers", {}))
+
+    def get_producer_processor(self):
+        """
+        Get the processor class that actually produced this dataset.
+
+        Falls back to `get_own_processor()` for datasets whose `type` was not
+        rewritten via `adopt_type`. UI code that renders the parameter panel
+        should use this so labels/tooltips come from the producing processor's
+        options schema, not from a possibly-divergent data-shape processor.
+
+        :return:  Processor class, or `None` if not available.
+        """
+        producer_type = self.parameters.get("producer_type", self.data.get("type"))
+        return self.modules.processors.get(producer_type)
+
+    def adopt_type(self, new_type):
+        """
+        Rewrite this dataset's `type` to reflect a change in the result file's
+        data shape (e.g. after a filter has copied its parent's NDJSON content
+        verbatim into its result). The original producing processor's type is
+        preserved under `parameters["producer_type"]` on the first call, so
+        the UI can still look up the right options schema.
+
+        This is the only sanctioned path for rewriting `type` post-creation;
+        direct attribute assignment is blocked by `__setattr__`. `datasource`
+        is orthogonal -- adjust it separately via `change_datasource` if the
+        platform grouping also needs to change.
+
+        :param str new_type:  The type to adopt.
+        """
+        current_type = self.data.get("type")
+        if new_type == current_type:
+            return
+
+        if "producer_type" not in self.parameters:
+            # preserve only the original producer; chained adopt_type calls
+            # must not overwrite the first one
+            self.parameters = {**self.parameters, "producer_type": current_type}
+
+        # bypass the __setattr__ guard via the underlying DB update path
+        self.db.update("datasets", where={"key": self.key}, data={"type": new_type})
+        self.data["type"] = new_type
 
     def get_available_processors(self, config=None, exclude_hidden=False):
         """
@@ -1933,37 +2189,37 @@ class DataSet(FourcatModule):
         :param ConfigManager|None config:  Configuration reader to determine
         compatibility through. This may not be the same reader the dataset was
         instantiated with, e.g. when checking whether some other user should
-        be able to run processors on this dataset.
-        :param bool exclude_hidden:  Exclude processors that should be displayed
-        in the UI? If `False`, all processors are returned.
+        be able to run processors on this dataset. The result is saved and
+        reused for later calls with the same reader.
+        :param bool exclude_hidden:  Exclude processors that should not be
+        displayed in the UI? If `False`, all processors are returned.
 
         :return dict:  Available processors, `name => properties` mapping
         """
-        if self.available_processors:
-            # Update to reflect exclude_hidden parameter which may be different from last call
-            # TODO: could children also have been created? Possible bug, but I have not seen anything effected by this
-            return {
-                processor_type: processor
-                for processor_type, processor in self.available_processors.items()
-                if not exclude_hidden or not processor.is_hidden
-            }
+        # The cache always holds the full list, hidden processors included, so
+        # that every call can apply its own exclude_hidden to it. It is None
+        # until the list has been worked out; an empty list is a valid result.
+        # Also cache the config used since the available processors may depend on it.
+        # TODO: could children also have been created? Possible bug, but I have not seen anything effected by this
+        if self.available_processors is None or config is not self._available_processors_config:
+            processors = self.get_compatible_processors(config=config)
 
-        processors = self.get_compatible_processors(config=config)
+            for analysis in self.get_children(update=True):
+                if analysis.type not in processors:
+                    continue
 
-        for analysis in self.get_children(update=True):
-            if analysis.type not in processors:
-                continue
+                if not processors[analysis.type].get_options(parent_dataset=self, config=config):
+                    # No variable options; this processor has been run so remove
+                    del processors[analysis.type]
 
-            if not processors[analysis.type].get_options(config=config):
-                # No variable options; this processor has been run so remove
-                del processors[analysis.type]
-                continue
+            self.available_processors = processors
+            self._available_processors_config = config
 
-            if exclude_hidden and processors[analysis.type].is_hidden:
-                del processors[analysis.type]
-
-        self.available_processors = processors
-        return processors
+        return {
+            processor_type: processor
+            for processor_type, processor in self.available_processors.items()
+            if not exclude_hidden or not processor.is_hidden
+        }
 
     def link_job(self, job):
         """
@@ -2165,6 +2421,90 @@ class DataSet(FourcatModule):
         # Default to text
         return self.parameters.get("media_type", "text")
 
+    def get_media_from_children(self, item_ids=None) -> dict:
+        """ Returns a list of media filenames that have been downloaded
+            via video or image download child processors
+
+        :param list item_ids:   A list of item IDs to limit the filename retrieval to.
+        returns dict: item_id as key and a list of tuples (child dataset key -> filename) as items
+        """
+        children = self.get_children()
+
+        if not children:
+            return {}
+
+        if item_ids is None:
+            item_ids = []
+
+        media_map = {}
+
+        # Get children that are image/video downloaders
+        media_datasets = [
+            p for p in children
+            if ("video-downloader" in p.type or "image-downloader" in p.type) and p.data.get("num_rows", 0) > 0 and p.is_finished()
+        ]
+
+        # Loop through media datasets and create a map of dataset key -> filenames
+        # Skip files that were downloaded multiple times
+        seen_files = set()
+
+        for media_dataset in media_datasets:
+            for item in media_dataset.iterate_items():
+
+                if item.file.name == ".metadata.json":
+                    with item.file.open() as infile:
+                        metadata = json.load(infile)
+
+                        for url_key, item_metadata in metadata.items():
+                            media_items = set()
+                            post_ids = item_metadata.get("post_ids", [])  # Required
+
+                            if not post_ids:
+                                continue
+
+                            # Make sure we're matching and passing strings
+                            post_ids = [str(p_id) for p_id in post_ids]
+                            item_ids = [str(i_id) for i_id in item_ids]
+
+                            # Skip items that are not in the requested item_ids
+                            if item_ids and not any(p_id in item_ids for p_id in post_ids):
+                                continue
+
+                            # Single file (images usually format like this)
+                            is_success = item_metadata.get("success", True)
+
+                            if is_success and "filename" in item_metadata:
+                                media_info = (media_dataset.key, item_metadata["filename"])
+                                media_items.add(media_info)
+
+                            # Multiple files (videos with the 'files' array)
+                            if item_metadata.get("files"):
+                                for file in item_metadata["files"]:
+                                    if file.get("success") and "filename" in file:
+                                        media_info = (media_dataset.key, file["filename"])
+                                        media_items.add(media_info)
+
+                            if not media_items:
+                                continue
+
+                            # Append to post_id list
+                            for post_id in post_ids:
+                                if post_id not in media_map:
+                                    media_map[post_id] = []
+
+                                for media_item in media_items:
+                                    if media_item not in media_map[post_id]:
+                                        # Don't add post_id -> filename couplings that we've already seen
+                                        media_ref = (post_id, media_item[1])
+                                        if media_ref not in seen_files:
+                                            media_map[post_id].append(media_item)
+                                        seen_files.add(media_ref)
+
+                    # break after .metadata.json
+                    break
+
+        return media_map
+
     def get_metadata(self):
         """
         Get dataset metadata
@@ -2189,22 +2529,49 @@ class DataSet(FourcatModule):
         SERVER_HTTPS) plus hardcoded '/result/'.
         TODO: create more dynamic method of obtaining url.
         """
-        filename = self.get_results_path().name
+        from flask import has_app_context, url_for
 
-        # we cheat a little here by using the modules' config reader, but these
-        # will never be context-dependent values anyway
-        url_to_file = ('https://' if self.modules.config.get("flask.https") else 'http://') + \
-                      self.modules.config.get("flask.server_name") + '/result/' + filename
-        return url_to_file
+        query_file = self.get_results_path().name
+        
+        # Use Flask's url_for if possible, to ensure we get the correct server name and protocol (e.g., if behind a reverse proxy)
+        if has_app_context():
+            return url_for(
+                "dataset.get_result",
+                dataset_key=self.key,
+                query_file=query_file,
+                _external=True
+            )
 
-    def warn_unmappable_item(
-            self, item_count, processor=None, error_message=None, warn_admins=True
-    ):
+        # Fallback for non-Flask contexts (e.g., backend and workers)
+        scheme = "https" if self.modules.config.get("flask.https") else "http"
+        server = self.modules.config.get("flask.server_name")
+        return f"{scheme}://{server}/download/{self.key}/"
+
+    def get_log_url(self):
         """
-        Log an item that is unable to be mapped and warn administrators.
+        Gets the 4CAT frontend URL of the dataset's log
+
+        Like `get_result_url()`, this uses the configured server name when
+        called outside the web app (e.g. in the backend).
+
+        :return str:  URL of the dataset log
+        """
+        from flask import has_app_context, url_for
+
+        if has_app_context():
+            return url_for("dataset.view_log", key=self.key, _external=True)
+
+        scheme = "https" if self.modules.config.get("flask.https") else "http"
+        server = self.modules.config.get("flask.server_name")
+        return f"{scheme}://{server}/results/{self.key}/log/"
+
+    def warn_unmappable_item(self, item_count, processor=None, error_message=None):
+        """
+        Log a per-item map_item failure to the dataset's own log.
 
         :param int item_count:			Item index
-        :param Processor processor:		Processor calling function8
+        :param Processor processor:		Processor calling function
+        :param error_message:			Optional exception or message
         """
         dataset_error_message = f"MapItemException (item {item_count}): {'is unable to be mapped! Check raw datafile.' if error_message is None else error_message}"
 
@@ -2217,21 +2584,39 @@ class DataSet(FourcatModule):
         # Log error to dataset log
         closest_dataset.log(dataset_error_message)
 
-        if warn_admins:
-            if processor is not None:
-                processor.log.warning(
-                    f"Processor {processor.type} unable to map item all items for dataset {closest_dataset.key}."
-                )
-            elif hasattr(self.db, "log"):
-                # borrow the database's log handler
-                self.db.log.warning(
-                    f"Unable to map item all items for dataset {closest_dataset.key}."
-                )
-            else:
-                # No other log available
-                raise DataSetException(
-                    f"Unable to map item {item_count} for dataset {closest_dataset.key} and properly warn"
-                )
+    def warn_unmappable_signatures(self, processor=None, signatures=None):
+        """
+        Emit a single rolled-up admin/dev alert summarising all unmappable-item
+        signatures encountered during an import.
+
+        Complements `warn_unmappable_item`, which writes one entry per item to
+        the user-facing dataset log; this method writes one rolled-up message
+        to the dev-facing log channel (Slack), so admins get file:line and
+        counts in a single alert rather than a stack trace per dataset.
+
+        :param processor:  Processor calling this method
+        :param dict signatures:  Mapping of (filename, lineno) -> {count, error, samples}
+        """
+        if not signatures:
+            return
+
+        total = sum(s["count"] for s in signatures.values())
+        proc_label = processor.type if processor is not None else "?"
+        lines = [
+            f"Processor {proc_label} could not map {total} item(s) for dataset "
+            f"{self.key} ({len(signatures)} signature(s)):"
+        ]
+        for (filename, lineno), info in sorted(signatures.items(), key=lambda kv: kv[1]["count"], reverse=True):
+            loc = f"{filename}:{lineno}" if lineno else (filename or "?")
+            sample_preview = ", ".join(str(s) for s in info.get("samples", []))
+            tail = f" (e.g. items {sample_preview})" if sample_preview else ""
+            lines.append(f"  {loc} — {info['count']} item(s): {info.get('error', '')}{tail}")
+
+        message = "\n".join(lines)
+        if processor is not None and hasattr(processor, "log"):
+            processor.log.warning(message)
+        elif hasattr(self.db, "log"):
+            self.db.log.warning(message)
 
     # Annotation functions (most of it is handled in Annotations)
     def has_annotations(self) -> bool:
@@ -2423,12 +2808,12 @@ class DataSet(FourcatModule):
                 )
             if "label" not in annotation_field:
                 raise AnnotationException(
-                    "Can't save annotation fields: all fields must have a label"
+                    "Can't save annotation fields: field %s must have a label"
                     % field_id
                 )
             if "type" not in annotation_field:
                 raise AnnotationException(
-                    "Can't save annotation fields: all fields must have a type"
+                    "Can't save annotation fields: field %s must have a type"
                     % field_id
                 )
 
@@ -2479,6 +2864,16 @@ class DataSet(FourcatModule):
         )
         return annotation_data
 
+    def is_preset(self):
+        """
+        Is this dataset a preset dataset?
+
+         Preset datasets are datasets that are generated by presets.
+
+         :return:  False
+        """
+        return self.get_own_processor() is not None and self.get_own_processor().is_preset()
+
     def __getattr__(self, attr):
         """
         Getter so we don't have to use .data all the time
@@ -2486,7 +2881,6 @@ class DataSet(FourcatModule):
         :param attr:  Data key to get
         :return:  Value
         """
-
         if attr in dir(self):
             # an explicitly defined attribute should always be called in favour
             # of this passthrough
@@ -2495,7 +2889,7 @@ class DataSet(FourcatModule):
         elif attr in self.data:
             return self.data[attr]
         else:
-            raise AttributeError("DataSet instance has no attribute %s" % attr)
+           raise AttributeError("DataSet instance has no attribute %s" % attr)
 
     def __setattr__(self, attr, value):
         """
@@ -2512,6 +2906,20 @@ class DataSet(FourcatModule):
         if attr in dir(self):
             super().__setattr__(attr, value)
             return
+
+        # `type` describes the data shape of the result file. It may diverge
+        # from the producing processor's type (e.g. a filter that copies its
+        # parent's NDJSON content verbatim). Direct rewrites would lose the
+        # producer identity needed by UI code; force callers through
+        # adopt_type() which preserves the original under parameters[
+        # "producer_type"].
+        if attr == "type" and self.data and self.data.get("type") and value != self.data["type"]:
+            raise AttributeError(
+                "Refusing to rewrite DataSet.type from %r to %r via direct attribute "
+                "assignment. Use DataSet.adopt_type() so the original producing "
+                "processor is preserved under parameters['producer_type']."
+                % (self.data["type"], value)
+            )
 
         if attr not in self.data:
             self.parameters[attr] = value

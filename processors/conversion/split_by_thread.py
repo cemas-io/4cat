@@ -4,6 +4,7 @@ Split results by thread
 import csv
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -22,19 +23,12 @@ class ThreadSplitter(BasicProcessor):
 	type = "split-threads"  # job type ID
 	category = "Conversion" # category
 	title = "Split by thread"  # title displayed in UI
-	description = "Split the dataset per thread. The result is a zip archive containing separate CSV files."  # description displayed in UI
+	description = "Split the dataset per thread. The result is a ZIP archive containing separate CSV files."  # description displayed in UI
 	extension = "zip"  # extension of result file, used internally and in UI
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Determine if processor is compatible with dataset
+	# datasets with a thread structure (4chan/8chan, reddit, breitbart)
+	compatibility = Compatibility(datasources={"fourchan", "eightchan", "reddit", "breitbart"})
 
-		:param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		return module.parameters.get("datasource") in ("4chan", "8chan", "reddit", "breitbart")
-		
 	def process(self):
 		"""
 		This takes a 4CAT results file as input, and outputs a new CSV file
@@ -51,11 +45,11 @@ class ThreadSplitter(BasicProcessor):
 			new = not thread.exists()
 
 			with thread.open("a", encoding="utf-8") as output:
-				outputcsv = csv.DictWriter(output, fieldnames=post.keys())
+				output_csv = csv.DictWriter(output, fieldnames=post.keys())
 
 				if new:
-					outputcsv.writeheader()
+					output_csv.writeheader()
 
-				outputcsv.writerow(post)
+				output_csv.writerow(post)
 
 		self.write_archive_and_finish(results_path)

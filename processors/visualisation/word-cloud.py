@@ -6,6 +6,7 @@ Make word clouds of columns with text and values
 from wordcloud import WordCloud
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
 
 __author__ = "Sal Hagen"
@@ -24,15 +25,11 @@ class MakeWordCloud(BasicProcessor):
 	description = "Generates a word cloud with words sized on occurrence."  # description displayed in UI
 	extension = "svg"
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow processor on rankable items
-
-		:param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		return module.type in ("tfidf", "collocations", "vector-ranker", "vectorise-tokens-by-category", "similar-word2vec", "extract-nouns", "get-entities")
+	# Allow processor on rankable items
+	compatibility = Compatibility(types={
+		"tfidf", "collocations", "vector-ranker", "vectorise-tokens-by-category",
+		"similar-word2vec", "extract-nouns", "get-entities"
+	})
 
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None):
@@ -66,6 +63,20 @@ class MakeWordCloud(BasicProcessor):
 					"type": UserInput.OPTION_TEXT,
 					"default": 200,
 					"help": "Max words to show"
+				},
+				"width": {
+					"type": UserInput.OPTION_TEXT,
+					"default": 1600,
+					"min": 100,
+					"max": 4000,
+					"help": "Width (px)"
+				},
+				"height": {
+					"type": UserInput.OPTION_TEXT,
+					"default": 1000,
+					"min": 100,
+					"max": 4000,
+					"help": "Height (px)"
 				}
 			}
 		return options
@@ -84,17 +95,21 @@ class MakeWordCloud(BasicProcessor):
 		try:
 			max_words = int(self.parameters.get("max_words"))
 		except (ValueError, TypeError):
-			max_words = self.parameters["max_words"]["default"]
+			max_words = 200
+		try:
+			width = int(self.parameters.get("width", 1600))
+			height = int(self.parameters.get("height", 1000))
+		except (ValueError, TypeError):
+			width, height = 1600, 1000
 
 		self.dataset.update_status("Extracting words and counts.")
 
 		if not word_column:
-			self.dataset.update_status("Please set a valid word column.")
-			self.finish(0)
+			self.dataset.finish_with_error("Please set a valid word column.")
+			return
 
 		if not count_column:
-			self.dataset.update_status("Please set a valid count column.")
-			self.finish(0)
+			self.dataset.finish_with_error("Please set a valid count column.")
 			return
 
 		for post in self.source_dataset.iterate_items(self):
@@ -108,8 +123,7 @@ class MakeWordCloud(BasicProcessor):
 			try:
 				count = int(post[count_column])
 			except ValueError:
-				self.dataset.update_status("Couldn't convert value '%s' to an integer. Please set a valid count column." % post[count_column])
-				self.dataset.finish(0)
+				self.dataset.finish_with_error(f"Couldn't convert value '{post[count_column]}' to an integer. Please set a valid count column.")
 				return
 
 			# Add to general dict
@@ -119,10 +133,20 @@ class MakeWordCloud(BasicProcessor):
 				words[word] = count
 
 		self.dataset.update_status("Making word cloud.")
-		cloud = WordCloud(prefer_horizontal=1, background_color="rgba(255, 255, 255, 0)", mode="RGBA", color_func=lambda *args, **kwargs: (0,0,0), width=1600, height=1000, collocations=False, max_words=max_words).generate_from_frequencies(words)
+		cloud = WordCloud(
+			prefer_horizontal=1,
+			random_state=42,
+			background_color="rgba(255, 255, 255, 0)",
+			mode="RGBA",
+			color_func=lambda *args, **kwargs: (0,0,0),
+			width=width,
+			height=height,
+			collocations=False,
+			max_words=max_words
+		).generate_from_frequencies(words)
 
 		# Write to svg
-		cloud = cloud.to_svg()
-		file = open(self.dataset.get_results_path(), "w")
+		cloud = cloud.to_svg(embed_font=True)  # we embed the font so placement stays the same
+		file = open(self.dataset.get_results_path(), "w", encoding="utf-8")
 		file.write(cloud)
 		self.dataset.finish(1)

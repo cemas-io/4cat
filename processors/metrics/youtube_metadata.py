@@ -10,7 +10,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from backend.lib.processor import BasicProcessor
-from common.lib.helpers import UserInput
+from common.lib.helpers import UserInput, urls_in_text
+from common.lib.compatibility import Compatibility
 
 __author__ = "Sal Hagen"
 __credits__ = ["Sal Hagen"]
@@ -31,11 +32,13 @@ class YouTubeMetadata(BasicProcessor):
 
 	type = "youtube-metadata"  # job type ID
 	category = "Metrics"  # category
-	title = "Extract metadata from YouTube URLs"  # title displayed in UI
-	description = "Collect metadata from YouTube videos, channels, and playlists with the YouTube API"  # description displayed in UI
+	title = "Fetch YouTube metadata from URLs"  # title displayed in UI
+	description = ("Collect metadata from YouTube videos, channels, and playlists that are linked to in the dataset. "
+				   "Uses the YouTube API.")  # description displayed in UI
 	extension = "csv"  # extension of result file, used internally and in UI
 
-	followups = ["youtube-thumbnails"]
+	# collector output or extract-urls-filter output, as csv/ndjson (may contain youtube links)
+	compatibility = Compatibility(is_collector=True, types={"extract-urls-filter"}, extensions={"csv", "ndjson"}, preferred_followups=["youtube-thumbnails"])
 
 	max_retries = 3
 	sleep_time = 20
@@ -51,15 +54,6 @@ class YouTubeMetadata(BasicProcessor):
 		"[4chan’s YouTube: A Fringe Perspective on YouTube’s Great Purge of 2019 - OILab.eu](https://oilab.eu/4chans-youtube-a-fringe-perspective-on-youtubes-great-purge-of-2019/)"
 	]
 
-	config = {
-		"api.youtube.key": {
-			"type": UserInput.OPTION_TEXT,
-			"default": "",
-			"help": "YouTube API key",
-			"tooltip": "Can be created on https://developers.google.com/youtube/v3"
-		}
-	}
-
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None) -> dict:
 
@@ -69,8 +63,9 @@ class YouTubeMetadata(BasicProcessor):
 				"help": "Columns with YouTube URLs",
 				"default": "url",
 				"inline": True,
-				"tooltip": "These should be valid YouTube URLs. Separate by comma. "
-						   "Use the Extract URLs processor if you need to extract URLs from text columns."
+				"tooltip": "These should contain YouTube URLs starting with http:// or https://, either on their own, "
+						   "as a list separated by commas, or in a text. Use the Extract URLs processor first if "
+						   "your links do not start with http:// or https://."
 			},
 			"save_annotations": {
 				"type": UserInput.OPTION_ANNOTATIONS,
@@ -134,18 +129,6 @@ class YouTubeMetadata(BasicProcessor):
 
 		return options
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow processor on datasets probably containing youtube links
-
-		:param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		# Compatible with every top-level dataset.
-		return ((module.is_top_dataset() and module.get_extension() in ("csv", "ndjson"))
-				or module.type == "extract-urls-filter")
-
 	def process(self):
 		"""
 		Writes a csv file with metadata of extracted YouTube objects.
@@ -187,13 +170,7 @@ class YouTubeMetadata(BasicProcessor):
 				if not data or not isinstance(data, str):
 					continue
 
-				# Split by URL by default
-				urls = data.split(",")
-
-				for url in urls:
-
-					# Get rid of unwanted (often trailing) characters
-					url = re.sub(r"[(),|]", "", url.strip())
+				for url in urls_in_text(data):
 
 					# Skip if not a YouTube URL
 					if "youtu.be" not in url and "youtube" not in url:
@@ -225,7 +202,7 @@ class YouTubeMetadata(BasicProcessor):
 
 		# Finish if there's no YouTube IDs
 		if not youtube_ids:
-			self.dataset.finish_with_error("No YouTube IDs found")
+			self.dataset.finish_as_empty("No YouTube IDs found")
 			return
 
 		# Start client
@@ -254,10 +231,11 @@ class YouTubeMetadata(BasicProcessor):
 
 			self.save_annotations(annotations)
 
+		warning = None
 		if failed_ids:
-			self.dataset.update_status(f"Could not parse IDs from {failed_ids} URLs.")
+			warning = f"Could not parse IDs from {failed_ids} URLs."
 		self.dataset.update_status("Writing results to csv.")
-		self.write_csv_items_and_finish(youtube_items)
+		self.write_csv_items_and_finish(youtube_items, warning=warning)
 
 	def get_youtube_metadata(self, yt_ids: list[tuple]) -> list:
 		"""

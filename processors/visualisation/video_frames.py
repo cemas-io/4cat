@@ -8,6 +8,7 @@ import shutil
 import oslex
 
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility, is_executable
 from common.lib.exceptions import ProcessorInterruptedException
 from common.lib.user_input import UserInput
 from processors.visualisation.download_videos import VideoDownloaderPlus
@@ -30,7 +31,8 @@ class VideoFrames(BasicProcessor):
 	description = "Extract frames from videos"  # description displayed in UI
 	extension = "zip"  # extension of result file, used internally and in UI
 
-	followups = ["video-timelines"] + VideoDownloaderPlus.followups
+	# Allow on video datasets when ffmpeg is available
+	compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, required_settings={("video-downloader.ffmpeg_path", is_executable)}, preferred_followups=["video-timelines"] + VideoDownloaderPlus.followups)
 
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -48,7 +50,7 @@ class VideoFrames(BasicProcessor):
 				"type": UserInput.OPTION_TEXT,
 				"help": "Number of frames extracted per second to extract from video",
 				"tooltip": "The default value is 1 frame per second. For 1 frame per 5 seconds pass 0.2 (1/5). For 5 fps "
-						"pass 5, and so on. Use '0' to only capture the first frame of the video.",
+						   "pass 5, and so on. Use '0' to only capture the first frame of the video.",
 				"coerce_type": float,
 				"default": 1,
 				"min": 0,
@@ -67,17 +69,6 @@ class VideoFrames(BasicProcessor):
 			},
 		}
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow on videos
-
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		return (module.get_media_type() == "video" or module.type.startswith("video-downloader")) and \
-			   config.get("video-downloader.ffmpeg_path") and \
-			   shutil.which(config.get("video-downloader.ffmpeg_path"))
-
 	def process(self):
 		"""
 		This takes a zipped set of videos, uses https://pypi.org/project/videohash/ and https://ffmpeg.org/ to collect
@@ -85,8 +76,7 @@ class VideoFrames(BasicProcessor):
 		"""
 		# Check processor able to run
 		if self.source_dataset.num_rows == 0:
-			self.dataset.update_status("No videos from which to extract frames.", is_final=True)
-			self.dataset.finish(0)
+			self.dataset.finish_with_error("No videos from which to extract frames.")
 			return
 
 		# Collect parameters
@@ -105,7 +95,7 @@ class VideoFrames(BasicProcessor):
 		processed_videos = 0
 
 		self.dataset.update_status("Extracting video frames")
-		for i, video in enumerate(self.source_dataset.iterate_items()):
+		for i, video in enumerate(self.source_dataset.iterate_items(self)):
 			if self.interrupted:
 				raise ProcessorInterruptedException("Interrupted while determining image wall order")
 
@@ -120,17 +110,18 @@ class VideoFrames(BasicProcessor):
 
 			command = [
 				shutil.which(self.config.get("video-downloader.ffmpeg_path")),
-				"-i", oslex.quote(str(video.file))
+				"-y", "-nostdin", "-i", str(video.file),
 			]
 
 			if frame_interval != 0:
-				command += ["-r", str(frame_interval)]
+				command.extend(["-r", str(frame_interval)])
 			else:
-				command += ["-vframes", "1"]
+				command.extend(["-vframes", "1"])
 
 			if frame_size != 'no_modify':
-				command += ['-s', oslex.quote(frame_size)]
-			command += [oslex.quote(str(video_dir) + "/video_frame_%07d.jpeg")]
+				command.extend(['-s', oslex.quote(frame_size)])
+
+			command.extend([str(video_dir.joinpath("video_frame_%07d.jpeg"))])
 
 			self.dataset.log(" ".join(command))
 
@@ -150,10 +141,12 @@ class VideoFrames(BasicProcessor):
 
 			if result.returncode != 0:
 				self.dataset.update_status(f"Unable to extract frames from video {vid_name} (see logs for details)")
-				self.dataset.log('Error Return Code (%s) with video %s: %s' % (str(result.returncode), vid_name, "\n".join(ffmpeg_error.split('\n')[-2:]) if ffmpeg_error else ''))
+				self.dataset.log('Error Return Code (%s) with video %s: %s' % (
+					str(result.returncode), vid_name, "\n".join(ffmpeg_error.split('\n')[-2:]) if ffmpeg_error else ''))
 			else:
 				processed_videos += 1
-				self.dataset.update_status("Created frames for %i of %i videos" % (processed_videos, total_possible_videos))
+				self.dataset.update_status(
+					"Created frames for %i of %i videos" % (processed_videos, total_possible_videos))
 
 			self.dataset.update_progress(i / total_possible_videos)
 
@@ -167,4 +160,9 @@ class VideoFrames(BasicProcessor):
 		from shutil import make_archive
 		make_archive(self.dataset.get_results_path().with_suffix(''), "zip", output_directory)
 
-		self.dataset.finish(processed_videos)
+		if processed_videos < total_possible_videos:
+			warning = "Could not extract frames for all videos. See the dataset log for details."
+			self.dataset.finish_with_warning(processed_videos, warning)
+		else:
+			self.dataset.finish(processed_videos)
+		return

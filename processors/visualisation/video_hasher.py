@@ -16,6 +16,7 @@ from videohash.exceptions import FFmpegNotFound, FFmpegFailedToExtractFrames
 
 from backend.lib.processor import BasicProcessor
 from backend.lib.preset import ProcessorAdvancedPreset
+from common.lib.compatibility import Compatibility, is_executable
 from common.lib.exceptions import ProcessorInterruptedException, ProcessorException
 from common.lib.user_input import UserInput
 
@@ -32,8 +33,11 @@ class VideoHasherPreset(ProcessorAdvancedPreset):
     type = "preset-video-hashes"  # job type ID
     category = "Visual"  # category. 'Combined processors' are always listed first in the UI.
     title = "Create video hashes to identify near duplicate videos"  # title displayed in UI
-    description = "Creates video hashes (64 bits/identifiers) to identify near duplicate videos in a dataset based on hash similarity. Uses video only (no audio; see references). This process can take a long time depending on video length, amount, and frames per second."
+    description = "Creates video hashes (64 bits/identifiers) to identify near duplicate videos in a dataset based on hash similarity. Uses video only. This process can take a long time depending on video length, amount, and frames per second."
     extension = "gexf"
+
+    # video datasets, when ffmpeg is available
+    compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, required_settings={("video-downloader.ffmpeg_path", is_executable)})
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -68,21 +72,6 @@ class VideoHasherPreset(ProcessorAdvancedPreset):
                 "default": False
             }
         }
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Determine compatibility
-
-        Compatible with downloaded videos, and not really anything else!
-        Additionally ffmpeg needs to be available.
-
-        :param DataSet module:  Module ID to determine compatibility with
-        :return bool:
-        """
-        return (module.get_media_type() == "video" or module.type.startswith("video-downloader")) and \
-               config.get("video-downloader.ffmpeg_path") and \
-               shutil.which(config.get("video-downloader.ffmpeg_path"))
 
     def get_processor_advanced_pipeline(self, attach_to=None):
         """
@@ -145,7 +134,8 @@ class VideoHasher(BasicProcessor):
     extension = "zip"  # extension of result file, used internally and in UI
     media_type = "image" # media type of the result
 
-    followups = ["video-hash-network", "video-hash-similarity-matrix"]
+    # video datasets (collages are made from video frames)
+    compatibility = Compatibility(media_types={"video"}, type_prefixes={"video-downloader"}, preferred_followups=["video-hash-network", "video-hash-similarity-matrix"])
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -174,13 +164,6 @@ class VideoHasher(BasicProcessor):
 
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow on videos only
-        """
-        return module.get_media_type() == "video" or module.type.startswith("video-downloader")
-
     def process(self):
         """
         This takes a zipped set of videos, uses https://pypi.org/project/videohash/ and https://ffmpeg.org/ to collect
@@ -188,8 +171,7 @@ class VideoHasher(BasicProcessor):
         """
         # Check processor able to run
         if self.source_dataset.num_rows == 0:
-            self.dataset.update_status("No videos to compare.", is_final=True)
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No videos to compare.")
             return
 
         # Collect parameters
@@ -209,7 +191,7 @@ class VideoHasher(BasicProcessor):
         processed_videos = 0
 
         self.dataset.update_status("Creating video hashes")
-        for video in self.source_dataset.iterate_items(staging_area=staging_area):
+        for video in self.source_dataset.iterate_items(self, staging_area=staging_area):
             if self.interrupted:
                 raise ProcessorInterruptedException("Interrupted while creating video hashes")
 
@@ -229,15 +211,14 @@ class VideoHasher(BasicProcessor):
                 videohash = VideoHash(path=str(video.file), storage_path=str(staging_area), frame_interval=frame_interval, do_not_copy=True)
             except FFmpegNotFound:
                 self.log.error('ffmpeg must be installed for video_hash.py processor to be used.')
-                self.dataset.update_status("FFmpeg software not found. Please contact 4CAT maintainers.", is_final=True)
-                self.dataset.finish(0)
+                self.dataset.finish_with_error("FFmpeg software not found. Please contact 4CAT maintainers.")
                 return
             except FileNotFoundError:
                 self.dataset.update_status(f"Unable to find file {video.file.name}")
                 continue
             except FFmpegFailedToExtractFrames as e:
-                self.dataset.update_status(f"Unable to extract frame for {video.file.name} (see log for details)")
                 self.dataset.log(f"Unable to extract frame for {str(video.file)}: {e}")
+                self.dataset.finish_with_error(f"Unable to extract frame for {video.file.name} (see log for details)")
                 continue
             except OSError:
                 self.dataset.finish_with_error("4CAT does not have the right privileges to access the video files.")
@@ -358,6 +339,9 @@ class VideoHashNetwork(BasicProcessor):
     description = "Creates hashes network to identify duplicate or similar videos."  # description displayed in UI
     extension = "gexf"  # extension of result file, used internally and in UI
 
+    # Allow on video hasher
+    compatibility = Compatibility(types={"video-hasher-1"})
+
     references = [
         "[Video Hash](https://github.com/akamhy/videohash#readme)",
     ]
@@ -372,13 +356,6 @@ class VideoHashNetwork(BasicProcessor):
             "max": 100
         }}
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow on video hasher
-        """
-        return module.type in ["video-hasher-1"]
-
     def process(self):
         """
 
@@ -388,8 +365,7 @@ class VideoHashNetwork(BasicProcessor):
             archive_contents = sorted(archive_file.namelist())
 
             if "video_hashes.csv" not in archive_contents:
-                self.dataset.update_status("Unable to obtain hashes from video colleges.", is_final=True)
-                self.dataset.finish(0)
+                self.dataset.finish_with_error("Unable to obtain hashes from video colleges.")
                 return
 
             # Prepare staging area for videos and video tracking
@@ -457,8 +433,7 @@ class VideoHashNetwork(BasicProcessor):
                     self.dataset.update_progress(comparisons / expected_comparisons)
 
         if len(network.edges) < 1:
-            self.dataset.update_status("No similar videos identified")
-            self.dataset.finish(0)
+            self.dataset.finish_as_empty("No similar videos identified")
             return
 
         self.dataset.update_status("Writing network file")
@@ -478,6 +453,9 @@ class VideoHashSimilarities(BasicProcessor):
     description = "Creates CSV with hashes and groups videos above similarity value."  # description displayed in UI
     extension = "csv"  # extension of result file, used internally and in UI
 
+    # Allow on video hasher
+    compatibility = Compatibility(types={"video-hasher-1"})
+
     references = [
         "[Video Hash](https://github.com/akamhy/videohash#readme)",
     ]
@@ -492,13 +470,6 @@ class VideoHashSimilarities(BasicProcessor):
             "max": 100
         }}
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow on video hasher
-        """
-        return module.type in ["video-hasher-1"]
-
     def process(self):
         """
 
@@ -510,8 +481,7 @@ class VideoHashSimilarities(BasicProcessor):
             archive_contents = sorted(archive_file.namelist())
 
             if "video_hashes.csv" not in archive_contents:
-                self.dataset.update_status("Unable to obtain hashes from video colleges.", is_final=True)
-                self.dataset.finish(0)
+                self.dataset.finish_with_error("Unable to obtain hashes from video colleges.")
                 return
 
             # Prepare staging area for videos and video tracking

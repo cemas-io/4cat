@@ -5,15 +5,15 @@ import requests
 import urllib3
 import shutil
 import json
-import re
 
 from PIL import Image, UnidentifiedImageError
 from requests.structures import CaseInsensitiveDict
 
-from common.lib.helpers import UserInput, url_to_filename
+from common.lib.helpers import UserInput, url_to_filename, urls_in_text, holds_only_urls, looks_like_image_url
 from backend.lib.processor import BasicProcessor
 from backend.lib.proxied_requests import FailedProxiedRequest
 from common.lib.exceptions import ProcessorInterruptedException, FourcatException
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -36,7 +36,7 @@ class ImageDownloader(BasicProcessor):
     category = "Visual"  # category
     title = "Download images"  # title displayed in UI
     description = (
-        "Download images and store in a a zip file. May take a while to complete as images are retrieved "
+        "Download images and store in a a ZIP file. May take a while to complete as images are retrieved "
         "externally. Note that not always all images can be saved. For imgur galleries, only the first "
         "image is saved. For animations (GIFs), only the first frame is saved if available. A JSON metadata file "
         "is included in the output archive."
@@ -44,6 +44,8 @@ class ImageDownloader(BasicProcessor):
     extension = "zip"  # extension of result file, used internally and in UI
     media_type = "image"  # media type of the dataset
 
+    # Shared list -- other download_* processors reuse this as ImageDownloader.followups
+    # (and preferred_followups below reuses it), so it stays a named attribute.
     followups = [
         "image-wall",
         "image-category-wall",
@@ -56,6 +58,9 @@ class ImageDownloader(BasicProcessor):
         "google-vision-api",
     ]
 
+    # top-image rankings or any collector's csv/ndjson output, except sources with their own image collection
+    compatibility = Compatibility(is_collector=True, types={"top-images"}, excluded_types={"tiktok-search", "tiktok-urls-search", "telegram-search", "fourchan-search"}, extensions={"csv", "ndjson"}, preferred_followups=followups)
+
     config = {
         "image-downloader.max": {
             "type": UserInput.OPTION_TEXT,
@@ -66,6 +71,8 @@ class ImageDownloader(BasicProcessor):
             "very long-running processors and large datasets. Set to 0 for no limit.",
         }
     }
+
+    warning_message = None
 
     @classmethod
     def get_options(cls, parent_dataset=None, config=None):
@@ -93,14 +100,8 @@ class ImageDownloader(BasicProcessor):
                 "help": "Column to get image links from",
                 "default": "image_url",
                 "inline": True,
-                "tooltip": "If column contains a single URL, use that URL; else, try to find image URLs in the column's content",
-            },
-            "split-comma": {
-                "type": UserInput.OPTION_TOGGLE,
-                "help": "Split column values by comma?",
-                "default": True,
-                "tooltip": "If enabled, columns can contain multiple URLs separated by commas, which will be considered "
-                "separately",
+                "tooltip": "If the column contains only URLs (one, or a list separated by commas), use those URLs; "
+                "else, try to find image URLs in the column's content",
             },
         }
 
@@ -136,27 +137,6 @@ class ImageDownloader(BasicProcessor):
 
         return options
 
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on top image rankings, collectors, but not specific collectors with their own image
-        collection methods
-
-        :param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return (
-            (module.type == "top-images" or module.is_from_collector())
-            and module.type
-            not in [
-                "tiktok-search",
-                "tiktok-urls-search",
-                "telegram-search",
-                "fourchan-search",
-            ]
-            and module.get_extension() in ("csv", "ndjson")
-        )
-
     def process(self):
         """
         This takes a 4CAT results file as input, and outputs a zip file with
@@ -168,7 +148,6 @@ class ImageDownloader(BasicProcessor):
 
         # Get the source file data path
         amount = self.parameters.get("amount", 100)
-        split_comma = self.parameters.get("split-comma", False)
 
         if amount == 0:
             amount = self.config.get("image-downloader.max", 1000)
@@ -216,19 +195,7 @@ class ImageDownloader(BasicProcessor):
                 if not value:
                     continue
 
-                # remove all whitespace from beginning and end (needed for single URL check)
-                values = [str(value).strip()]
-                if split_comma:
-                    values = values[0].split(",")
-
-                for value in values:
-                    if re.match(r"https?://(\S+)$", value):
-                        # single URL
-                        item_urls.add(value)
-                    else:
-                        # search for URLs in string
-                        for regex in self.get_link_regexes():
-                            item_urls |= set(regex.findall(value))
+                item_urls |= self.find_image_urls(str(value))
 
             item_urls = self.preprocess_urls(item_urls)
             for item_url in item_urls:
@@ -241,7 +208,7 @@ class ImageDownloader(BasicProcessor):
                 urls.append(item_url)
 
         if not urls:
-            return self.dataset.finish_with_error(
+            return self.dataset.finish_as_empty(
                 "No download URLs could be extracted from the dataset within the given parameters."
             )
         else:
@@ -284,25 +251,30 @@ class ImageDownloader(BasicProcessor):
         max_images = min(len(urls), amount) if amount > 0 else len(urls)
         self.dataset.log(f"Starting download of up to {max_images:,} image(s).")
         for url, response in self.iterate_proxied_requests(
-            urls,
-            preserve_order=False,
-            headers={"User-Agent": ua},
-            hooks={
-                # use hooks to download the content (stream=True) in parallel
-                "response": self.stream_url
-            },
-            verify=False,
-            timeout=20,
-            stream=True,
-        ):
+                urls,
+                preserve_order=False,
+                headers={"User-Agent": ua, **self.source_dataset.get_media_request_headers()},
+                hooks={
+                    # use hooks to download the content (stream=True) in parallel
+                    "response": self.stream_url
+                },
+                verify=False,
+                timeout=20,
+                stream=True,
+            ):
             downloaded_file = self.staging_area.joinpath(self.filenames[url])
             failure = False
 
             if self.interrupted:
-                self.completed = True
+                self.complete = True
                 self.flush_proxied_requests()
-                shutil.rmtree(self.staging_area)
-                raise ProcessorInterruptedException()
+                if len(downloaded_files) > 0:
+                    # Some files downloaded, wrap up
+                    self.warning_message = "Processor was interrupted; partial results have been saved."
+                    break
+                else:
+                    shutil.rmtree(self.staging_area)
+                    raise ProcessorInterruptedException()
 
             if type(response) is FailedProxiedRequest:
                 if type(response.context) is requests.exceptions.Timeout:
@@ -439,12 +411,21 @@ class ImageDownloader(BasicProcessor):
             url_file = self.staging_area.joinpath(filename)
             if url_file.exists() and url not in downloaded_files:
                 url_file.unlink()
-
+                
         # finish up
         self.dataset.update_progress(1.0)
         self.write_archive_and_finish(
-            self.staging_area, len([x for x in metadata.values() if x.get("success")])
+            self.staging_area, len([x for x in metadata.values() if x.get("success")]),
+            finish=False
         )
+        if self.warning_message:
+            # Interrupted but some files downloaded
+            self.dataset.finish_with_warning(len(downloaded_files), self.warning_message)
+        else:
+            # Successful or empty completion
+            if len(downloaded_files) == 0:
+                self.dataset.update_status("No results.", is_final=True)
+            self.dataset.finish(len(downloaded_files))
 
     def clean_url(self, url):
         # always lower case domain
@@ -582,28 +563,29 @@ class ImageDownloader(BasicProcessor):
 
         return url
 
-    def get_link_regexes(self):
+    @staticmethod
+    def find_image_urls(value):
         """
-        Get regexes to extract relevant links from text
+        Find the URLs to download images from in a column value
 
-        :return list:  List of compiled regular expressions
+        If the value holds nothing but URLs (one, or a list), all of them are
+        used: the column is then meant to hold image links, even if they do not
+        look like one, as many image hosts leave out the file extension.
+        Otherwise the value is ordinary text, and only the URLs in it that look
+        like image links are used.
+
+        :param str value:  Column value
+        :return set:  Image URLs
         """
-        return [
-            # for image URL extraction, we use the following heuristic:
-            # Makes sure that it gets "http://site.com/img.jpg", but also
-            # more complicated ones like
-            # https://preview.redd.it/3thfhsrsykb61.gif?format=mp4&s=afc1e4568789d2a0095bd1c91c5010860ff76834
-            re.compile(
-                r"(?:www\.|https?:\/\/)[^\s\(\)\]\[,']*\.(?:png|jpg|jpeg|gif|gifv)[^\s\(\)\]\[,']*",
-                re.IGNORECASE,
-            ),
-            # Imgur and gfycat links that do not end in an extension are also accepted.
-            # These can later be downloaded by adding an extension.
-            re.compile(
-                r"(?:https:\/\/gfycat\.com\/|https:\/\/imgur\.com\/)[^\s\(\)\]\[,']*",
-                re.IGNORECASE,
-            ),
-        ]
+        urls = urls_in_text(value)
+
+        if holds_only_urls(value, urls):
+            # a single URL or a list of URLs: the column is meant to hold image
+            # links, so use them all, even those without an image extension
+            return set(urls)
+
+        # text with links in it: only use the links that look like images
+        return {url for url in urls if looks_like_image_url(url)}
 
     def get_valid_file_extension(self, file):
         """

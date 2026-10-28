@@ -6,6 +6,7 @@ import csv
 
 from unidecode import unidecode
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 from common.lib.helpers import UserInput
 
 __author__ = "Stijn Peeters"
@@ -22,21 +23,13 @@ class AccentFoldingFilter(BasicProcessor):
     """
     type = "accent-folder"  # job type ID
     category = "Filtering"  # category
-    title = "Replace or transliterate accented and non-Latin characters"  # title displayed in UI
-    description = "Replaces non-latin characters with the closest ASCII equivalent, convertng e.g. 'á' to 'a', 'ç' " \
-                  "to 'c', et cetera. Creates a new dataset."
+    title = "Convert accented and non-Latin characters"  # title displayed in UI
+    description = ("Replaces or transliterates non-Latin characters with the closest ASCII equivalent, converting e.g. "
+                   "'á' to 'a', 'ç' to 'c', etc. This creates a new dataset.")
     extension = "csv"  # extension of result file, used internally and in UI
 
-
-    @classmethod
-    def is_compatible_with(cls, module=None, config=None):
-        """
-        Allow processor on iterable files
-
-        :param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        """
-        return module.is_top_dataset() and module.get_extension() in ["csv",]
+    # Allow on top-level CSV datasets
+    compatibility = Compatibility(top_dataset_only=True, extensions={"csv"})
 
     def process(self):
         """
@@ -69,6 +62,8 @@ class AccentFoldingFilter(BasicProcessor):
                     self.dataset.update_progress((processed_items / self.source_dataset.num_rows))
 
                 for field in columns:
+                    if field not in item:
+                        continue
                     if type(item[field]) is not str:
                         continue
 
@@ -103,7 +98,7 @@ class AccentFoldingFilter(BasicProcessor):
         :param config ConfigManager|None config:  Configuration reader (context-aware)
         :return dict:   Options for this processor
         """
-            
+
         options = {
             "mode": {
                 "help": "What to replace?",

@@ -12,6 +12,7 @@ from svgwrite.text import Text
 
 from backend.lib.processor import BasicProcessor
 from common.lib.helpers import UserInput, pad_interval, get_4cat_canvas
+from common.lib.compatibility import Compatibility
 
 __author__ = "Stijn Peeters"
 __credits__ = ["Stijn Peeters"]
@@ -25,8 +26,11 @@ class SVGHistogramRenderer(BasicProcessor):
 	type = "histogram"  # job type ID
 	category = "Visual"  # category
 	title = "Histogram"  # title displayed in UI
-	description = "Generates a histogram (bar graph) from time frequencies."  # description displayed in UI
+	description = "Generates a histogram from time frequencies."  # description displayed in UI
 	extension = "svg"
+
+	# rankable datasets with a single value per item (multiple_items=False)
+	compatibility = Compatibility(rankable=True, rankable_multiple_items=False)
 
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None) -> dict:
@@ -48,16 +52,6 @@ class SVGHistogramRenderer(BasicProcessor):
 			}
 		}
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow processor on rankable items
-
-		:param module: Dataset or processor to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		return module.is_rankable(multiple_items=False)
-		
 	def process(self):
 		"""
 		Render an SVG histogram/bar chart using a previous frequency analysis
@@ -87,16 +81,14 @@ class SVGHistogramRenderer(BasicProcessor):
 				self.dataset.log("Removed non-date interval: %s" % non_date)
 
 		if len(intervals) <= 1:
-			self.dataset.update_status("Not enough data available for a histogram; need more than one time series.")
-			self.dataset.finish(0)
+			self.dataset.finish_with_error("Not enough data available for a histogram; need more than one time series.")
 			return
 
 		self.dataset.update_status("Cleaning up data")
 		try:
 			(missing, intervals) = pad_interval(intervals)
 		except ValueError:
-			self.dataset.update_status("Some of the items in the dataset contain invalid dates; cannot count frequencies per interval.", is_final=True)
-			self.dataset.finish(0)
+			self.dataset.finish_with_error("Some of the items in the dataset contain invalid dates; cannot count frequencies per interval.")
 			return
 
 		# create histogram

@@ -2,6 +2,7 @@
 Extract neologisms
 """
 from backend.lib.preset import ProcessorPreset
+from common.lib.compatibility import Compatibility
 from processors.metrics.count_posts import CountPosts
 
 
@@ -12,22 +13,12 @@ class MonthlyHistogramCreator(ProcessorPreset):
 	type = "preset-histogram"  # job type ID
 	category = "Combined processors"  # category. 'Combined processors' are always listed first in the UI.
 	title = "Histogram"  # title displayed in UI
-	description = "Visualize graphically the number of posts over time."  # description displayed in UI
+	description = "Create a histogram that shows the number of items over time."  # description displayed in UI
 	extension = "svg"
 
-	@staticmethod
-	def is_compatible_with(module=None, config=None):
-		"""
-        Determine compatibility
+	# Allow on top-level CSV/NDJSON datasets
+	compatibility = Compatibility(top_dataset_only=True, extensions={"csv", "ndjson"})
 
-        This preset is compatible with any module that has countable items (via count-posts)
-
-        :param Dataset module:  Module ID to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-        :return bool:
-        """
-		return module.is_top_dataset() and module.get_extension() in ("csv", "ndjson")
-	
 	@classmethod
 	def get_options(cls, parent_dataset=None, config=None):
 		count_options = CountPosts.get_options(parent_dataset=parent_dataset, config=config)

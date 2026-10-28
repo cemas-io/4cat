@@ -9,6 +9,7 @@ import itertools
 
 from common.lib.helpers import UserInput, convert_to_int
 from backend.lib.processor import BasicProcessor
+from common.lib.compatibility import Compatibility
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from gensim.models import TfidfModel
@@ -31,7 +32,15 @@ class TfIdf(BasicProcessor):
 	description = "Get the tf-idf values of tokenised text. Works better with more documents (e.g. time-separated)."  # description displayed in UI
 	extension = "csv"  # extension of result file, used internally and in UI
 
-	followups = ["wordcloud"]
+	# Allow processor on token sets
+	compatibility = Compatibility(
+		types={"tokenise-posts"},
+		preferred_followups=["wordcloud"],
+		excluded_followups=[
+			"consolidate-urls", "preset-neologisms", "sentence-split", "tokenise-posts",
+			"image-downloader-stable-diffusion", "word-trees", "histogram", "extract-urls-filter",
+		],
+	)
 
 	references = [
 		"[Spärck Jones, Karen. 1972. \"A statistical interpretation of term specificity and its application in retrieval.\" *Journal of Documentation* (28), 1: 11–21.](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.115.8343&rep=rep1&type=pdf)",
@@ -105,16 +114,6 @@ class TfIdf(BasicProcessor):
 			}
 		}
 
-	@classmethod
-	def is_compatible_with(cls, module=None, config=None):
-		"""
-		Allow processor on token sets
-
-		:param module: Module to determine compatibility with
-        :param ConfigManager|None config:  Configuration reader (context-aware)
-		"""
-		return module.type == "tokenise-posts"
-
 	def process(self):
 		"""
 		Unzips and appends tokens to fetch and write a tf-idf matrix
@@ -141,7 +140,7 @@ class TfIdf(BasicProcessor):
 		dates = []
 
 		# Go through all archived token sets and generate collocations for each
-		for token_file in self.source_dataset.iterate_items():
+		for token_file in self.source_dataset.iterate_items(self):
 			if token_file.file.name == '.token_metadata.json':
 				# Skip metadata
 				continue
@@ -164,8 +163,7 @@ class TfIdf(BasicProcessor):
 					tokens.append(item_tokens)
 
 			except UnicodeDecodeError:
-				self.dataset.update_status("Error reading input data. If it was imported from outside 4CAT, make sure it is encoded as UTF-8.", is_final=True)
-				self.dataset.finish(0)
+				self.dataset.finish_with_error("Error reading input data. If it was imported from outside 4CAT, make sure it is encoded as UTF-8.")
 				return
 
 		# Make sure `min_occurrences` and `max_occurrences` are valid
@@ -174,7 +172,7 @@ class TfIdf(BasicProcessor):
 		if max_occurrences <= 0 or max_occurrences > len(tokens):
 			max_occurrences = len(tokens)
 		self.dataset.log(f"Running tf-idf with library {library}, n_size {n_size}, min_occurrences {min_occurrences}, max_occurrences {max_occurrences}, max_output {max_output}, smartirs {smartirs}")
-		
+
 		# Get the tf-idf matrix.
 		self.dataset.update_status("Generating tf-idf for token set")
 		try:
@@ -185,8 +183,7 @@ class TfIdf(BasicProcessor):
 				results = self.get_tfidf_sklearn(tokens, dates, ngram_range=n_size, min_occurrences=min_occurrences,
 								 max_occurrences=max_occurrences, top_n=max_output)
 			else:
-				self.dataset.update_status("Invalid library.")
-				self.dataset.finish(0)
+				self.dataset.finish_with_error("Invalid library.")
 				return
 
 			if results:
@@ -195,8 +192,8 @@ class TfIdf(BasicProcessor):
 				self.write_csv_items_and_finish(results)
 
 		except MemoryError:
-			self.dataset.update_status("Out of memory - dataset too large to run tf-idf analysis.")
-			self.dataset.finish(0)
+			self.dataset.finish_with_error("Out of memory - dataset too large to run tf-idf analysis.")
+			return
 
 	def get_tfidf_gensim(self, tokens, dates, top_n=25, smartirs="nfc"):
 		"""
@@ -274,8 +271,7 @@ class TfIdf(BasicProcessor):
 			tfidf_matrix = tfidf_vectorizer.fit_transform(tokens)
 		except ValueError as e:
 			self.dataset.log(f"sklearn ValueError: {e!r}")
-			self.dataset.update_status("No tokens remain with these parameters. Set less strict constraints and try again.", is_final=True)
-			self.dataset.finish(0)
+			self.dataset.finish_with_error("No tokens remain with these parameters. Set less strict constraints and try again.")
 			return
 
 		np.array(tfidf_vectorizer.get_feature_names_out())
@@ -309,12 +305,3 @@ class TfIdf(BasicProcessor):
 				results.append(result)
 
 		return results
-
-	@classmethod
-	def exclude_followup_processors(cls, processor_type):
-		"""
-		Exclude followups if they are not compatible with the module
-		"""
-		if processor_type in ["consolidate-urls", "preset-neologisms", "sentence-split", "tokenise-posts", "image-downloader-stable-diffusion", "word-trees", "histogram", "extract-urls-filter"]:
-			return True
-		return False
